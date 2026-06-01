@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import time
 from pathlib import Path
 from datetime import datetime
@@ -21,6 +22,8 @@ ROOT_DIR = BASE_DIR.parent                      # корень проекта
 
 SKU_FILE = ROOT_DIR / "SKU_Ozon.txt"
 REPORTS_DIR = ROOT_DIR / "reports"
+SESSION_FILE = ROOT_DIR / "ozon_session.json"
+OZON_HOME_URL = "https://www.ozon.ru/"
 
 
 # ===============================
@@ -62,6 +65,7 @@ def load_links(file_path):
     with open(file_path, "r", encoding="utf-8") as file:
         return [line.strip() for line in file if line.strip()]
 
+
 def is_page_available(driver, timeout=5):
     try:
         WebDriverWait(driver, timeout).until(
@@ -70,6 +74,7 @@ def is_page_available(driver, timeout=5):
         return True
     except Exception:
         return False
+
 
 def get_element(driver, xpaths, default=None, timeout=5):
     for xpath in xpaths:
@@ -86,6 +91,7 @@ def get_element(driver, xpaths, default=None, timeout=5):
             continue
 
     return default
+
 
 def clear_price(value: str):
 
@@ -105,6 +111,63 @@ def clear_price(value: str):
 
     except ValueError:
         return None
+
+
+def prepare_cookie(cookie: dict):
+    """Оставляем только поля, которые Selenium стабильно принимает в add_cookie."""
+    allowed_keys = {"name", "value", "path", "domain", "secure", "httpOnly", "expiry"}
+    prepared = {key: value for key, value in cookie.items() if key in allowed_keys}
+
+    if "expiry" in prepared:
+        try:
+            prepared["expiry"] = int(prepared["expiry"])
+        except Exception:
+            prepared.pop("expiry", None)
+
+    return prepared
+
+
+def load_ozon_session(driver):
+    """Загружает сохранённую Ozon-сессию с выбранным ПВЗ/регионом."""
+    if not SESSION_FILE.exists():
+        print("[WARNING] ozon_session.json not found. Region/PVZ may be detected automatically.")
+        return
+
+    try:
+        driver.get(OZON_HOME_URL)
+        is_page_available(driver, timeout=10)
+
+        with open(SESSION_FILE, "r", encoding="utf-8") as file:
+            session = json.load(file)
+
+        skipped_cookies = 0
+        for cookie in session.get("cookies", []):
+            try:
+                driver.add_cookie(prepare_cookie(cookie))
+            except Exception:
+                skipped_cookies += 1
+
+        local_storage = session.get("localStorage", {})
+        for key, value in local_storage.items():
+            try:
+                driver.execute_script(
+                    "window.localStorage.setItem(arguments[0], arguments[1]);",
+                    key,
+                    value
+                )
+            except Exception:
+                continue
+
+        driver.refresh()
+        time.sleep(2)
+
+        if skipped_cookies:
+            print(f"OZON session loaded. Skipped cookies: {skipped_cookies}")
+        else:
+            print("OZON session loaded")
+
+    except Exception as error:
+        print(f"[WARNING] OZON session was not loaded: {error}")
 
 
 # ===============================
@@ -172,10 +235,12 @@ def parse_product_page(driver, article):
 # ===============================
 
 def create_driver():
-    return webdriver.Chrome(
+    driver = webdriver.Chrome(
         service=Service(ChromeDriverManager().install()),
         options=chrome_options
     )
+    load_ozon_session(driver)
+    return driver
 
 
 # ===============================
@@ -184,12 +249,14 @@ def create_driver():
 
 def process_articles(articles, max_threads=3):
     results = []
+
     def worker(article):
         driver = create_driver()
         try:
             return parse_product_page(driver, article)
         finally:
             driver.quit()
+
     with ThreadPoolExecutor(max_workers=max_threads) as executor:
         futures = [executor.submit(worker, article) for article in articles]
         for future in as_completed(futures):
