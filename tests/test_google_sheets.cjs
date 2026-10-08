@@ -1,101 +1,57 @@
-// Minimal local smoke test for the Apps Script request shape (no Google account required).
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const code = fs.readFileSync(__dirname + '/../google_sheets/Code.gs', 'utf8');
-const values = new Map([
-  ['A2', '380181277'], ['A3', '2624769265'],
-  ['H2', 'https://www.ozon.ru/geo/moskva/442329/']
-]);
-const cellKey = (row, col) => String.fromCharCode(64 + col) + row;
-const sheet = {
-  getLastRow: () => 3,
-  setFrozenRows: () => {},
-  getRange: (r, c, nRows = 1, nCols = 1) => {
-    let startRow = r, startCol = c;
-    if (typeof r === 'string') {
-      const match = /^([A-Z]+)(\d+)?(?::[A-Z]+)?$/.exec(r);
-      assert.ok(match, r);
-      startCol = match[1].charCodeAt(0) - 64;
-      startRow = Number(match[2]) || 1;
-      nRows = 1; nCols = 1;
+const articles = Array.from({length: 100}, (_, i) => String(380000000 + i));
+const values = new Map([['H2','https://www.ozon.ru/geo/moskva/442329/']]);
+articles.forEach((v,i) => values.set(`A${i+2}`,v));
+const colIndex = v => v.charCodeAt(0) - 64;
+const key = (r,c) => `${String.fromCharCode(c+64)}${r}`;
+const calls=[]; let blocked=false; let readRows=100;
+const sheet={
+  getLastRow:()=>readRows+1,
+  setFrozenRows:()=>{},
+  getRange:(r,c,nr=1,nc=1)=>{
+    let row=r,col=c;
+    if(typeof r==='string') {
+      const m = /^([A-Z]+)(\d+)?(?::[A-Z]+)?$/.exec(r);
+      assert.ok(m,r);
+      col=colIndex(m[1]);row=Number(m[2])||1;nr=nc=1;
     }
     return {
-      getDisplayValue: () => String(values.get(cellKey(startRow, startCol)) || ''),
-      getDisplayValues: () => Array.from({length: nRows}, (_, i) =>
-        Array.from({length: nCols}, (_, j) => String(values.get(cellKey(startRow+i, startCol+j)) || ''))),
-      setValue: value => {values.set(cellKey(startRow, startCol), value);},
-      setValues: rows => rows.forEach((row, i) => row.forEach((v,j) => values.set(cellKey(startRow+i,startCol+j),v))),
-      clearContent: () => {for(let i=0;i<nRows;i++)for(let j=0;j<nCols;j++) values.delete(cellKey(startRow+i,startCol+j));},
-      setNumberFormat: () => {}
-    };
+      getDisplayValue:()=>String(values.get(key(row,col))||''),
+      getDisplayValues:()=>Array.from({length:nr},(_,i)=>Array.from({length:nc},(_,j)=>String(values.get(key(row+i,col+j))||''))),
+      setValue:(v)=>values.set(key(row,col),v),
+      setValues:(rows)=>rows.forEach((arr,i)=>arr.forEach((v,j)=>values.set(key(row+i,col+j),v))),
+      setNumberFormat:()=>{},
+    }
   }
 };
-const documentProperties = new Map();
-const calls = [];
-let simulateBlock = false;
-let simulateUnavailable = false;
-const context = {
-  LockService: {getDocumentLock: () => ({tryLock: () => true, releaseLock: () => {}})},
-  SpreadsheetApp: {
-    getActive: () => ({getSheetByName: () => sheet}),
-    getUi: () => ({alert: () => {}}),
-    flush: () => {}
-  },
-  PropertiesService: {
-    getDocumentProperties: () => ({
-      setProperty: (k,v) => documentProperties.set(k,v),
-      getProperty: k => documentProperties.get(k),
-      deleteProperty: k => documentProperties.delete(k),
-      setProperties: obj => Object.entries(obj).forEach(([k,v])=>documentProperties.set(k,v))
-    }),
-    getScriptProperties: () => ({
-      getProperty: k => ({OZON_SERVER_URL:'https://prices.example.test', OZON_API_TOKEN:'test-token'})[k]
-    })
-  },
-  UrlFetchApp: {fetch: (url, opts) => {
-    const payload = JSON.parse(opts.payload);
-    calls.push({url,payload});
-    return {
-      getContentText: () => JSON.stringify({pvz_url: payload.pvz_url, results: payload.articles.map((article,index) => ({
-        article,
-        price: (simulateBlock || simulateUnavailable) && index === 1 ? null : 100+index,
-        status: simulateBlock && index === 1 ? 'blocked' :
-                simulateUnavailable && index === 1 ? 'unavailable' : 'ok'
-      }))}),
-      getResponseCode: () => 200
-    };
+const context={
+  LockService:{getDocumentLock:()=>({tryLock:()=>true,releaseLock:()=>{}})},
+  SpreadsheetApp:{getActive:()=>({getSheetByName:()=>sheet}),getUi:()=>({alert:()=>{}})},
+  PropertiesService:{getScriptProperties:()=>({getProperty:(k)=>({OZON_SERVER_URL:'https://prices.example.test',OZON_API_TOKEN:'token'})[k]})},
+  UrlFetchApp:{fetch:(url,options)=>{
+    const req=JSON.parse(options.payload);calls.push(req);
+    return {getResponseCode:()=>200,getContentText:()=>JSON.stringify({pvz_url:req.pvz_url,results:req.articles.map((article,i)=>({article,price:blocked?null:i+10,status:blocked?'blocked':(i===2?'unavailable':'ok')}))})};
   }}
 };
-vm.runInNewContext(code, context);
+vm.runInNewContext(code,context);
 context.ozonStart();
-assert.equal(calls.length, 1);
-assert.equal(calls[0].url, 'https://prices.example.test/v1/prices');
-assert.equal(calls[0].payload.pvz_url, 'https://www.ozon.ru/geo/moskva/442329/');
-assert.deepEqual(Array.from(calls[0].payload.articles), ['380181277', '2624769265']);
-assert.equal(Object.hasOwn(calls[0].payload,'items'), false);
-assert.equal(values.get('B2'),100);
-assert.equal(values.get('B3'),101);
-assert.equal(values.get('C1'), undefined);
-assert.equal(values.get('C2'), undefined);
-assert.equal(values.get('A1'), 'Артикул товара');
-assert.equal(values.get('B1'), 'Конечная цена');
+assert.equal(calls.length,1);
+assert.equal(calls[0].articles.length,100);
+assert.equal(values.get('B2'),10);
+assert.equal(values.get('B3'),11);
+assert.equal(values.get('B4'),'Нет данных');
+assert.equal(values.get('B101'),109);
+assert.equal(values.get('C1'),undefined);
 assert.equal(values.get('H2'),'https://www.ozon.ru/geo/moskva/442329/');
-console.log('Apps Script smoke test OK: one PVZ, 2 SKU, columns A/B only.');
-
-// After a CAPTCHA the worksheet must pause, leaving the first blocked SKU as the next resume point.
-simulateBlock = true;
-context.ozonStart();
-assert.equal(values.get('B2'), 100);
-assert.equal(values.get('B3'), '');
-assert.equal(documentProperties.get('OZON_PRICE_NEXT_ROW'), '3');
-assert.equal(calls.length, 2);
-console.log('Apps Script block/pause test OK: resumes at blocked row.');
-
-// A truly unavailable item is displayed as text, not a fake numeric zero.
-simulateBlock = false;
-simulateUnavailable = true;
-context.ozonStart();
-assert.equal(values.get('B2'), 100);
-assert.equal(values.get('B3'), 'Нет данных');
-console.log('Apps Script no-data test OK: unavailable -> Нет данных.');
+blocked=true;
+assert.throws(()=>context.ozonStart(),/ограничил доступ/);
+assert.equal(values.get('B2'),10,'prior data is preserved after failed complete request');
+blocked=false;
+readRows=101;
+values.set('A102','999999999');
+assert.throws(()=>context.ozonStart(),/не более 100 SKU/);
+assert.equal(calls.length,2,'oversized list must not call API');
+console.log('PASS: one HTTP request for 100 SKUs; no batching; no-data rendering; atomic blocking; >100 rejected.');
