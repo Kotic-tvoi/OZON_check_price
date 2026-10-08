@@ -19,7 +19,10 @@ def _cell(ref: str, value) -> str:
 def to_xlsx(results: list[PriceResult]) -> bytes:
     """Legacy 2 columns, no file saved on server."""
     rows = [["Артикул товара", "Конечная цена"]]
-    rows.extend([[row.article, row.price] for row in results])
+    rows.extend([[row.article,
+                  row.price if row.price is not None else
+                  'Нет данных' if row.status in ('unavailable', 'no_price') else None]
+                 for row in results])
     body = []
     for index, values in enumerate(rows, 1):
         # SKU is stored as text to preserve its exact digits.
