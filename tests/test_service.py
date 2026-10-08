@@ -85,7 +85,7 @@ class TestScraper(unittest.TestCase):
             index=item.index, article=item.article, pvz_url=item.pvz_url, price=200,
             status='ok')
         items = validate_request({'articles': ['123', '456', '789']})
-        results = scan_items(items)
+        results = scan_items(items, workers=1)
         self.assertEqual([r.price for r in results], [200, 200, 200])
         self.assertEqual(new_driver.call_count, 1)
         self.assertEqual(driver.quit.call_count, 1)
@@ -115,7 +115,7 @@ class TestScraper(unittest.TestCase):
                 pvz_url=item.pvz_url, status='blocked' if item.index == 1 else 'ok',
                 price=None if item.index == 1 else 100)
         read_article.side_effect = process
-        results = scan_items(validate_request({'articles': ['111', '222', '333', '444']}))
+        results = scan_items(validate_request({'articles': ['111', '222', '333', '444']}), workers=1)
         # The first successful price is discarded with the failed attempt.
         self.assertEqual([r.status for r in results], ['blocked'] * 4)
         self.assertEqual([r.price for r in results], [None] * 4)
@@ -128,7 +128,7 @@ class TestScraper(unittest.TestCase):
     @patch('scraper.create_driver')
     def test_block_on_pvz_stops_entire_batch(self, new_driver, set_pvz):
         new_driver.return_value = MagicMock()
-        results = scan_items(validate_request({'articles': ['111', '222']}))
+        results = scan_items(validate_request({'articles': ['111', '222']}), workers=1)
         self.assertEqual([r.status for r in results], ['blocked', 'blocked'])
         self.assertEqual(set_pvz.call_count, 5)
         self.assertEqual(new_driver.return_value.quit.call_count, 5)
@@ -151,7 +151,7 @@ class TestScraper(unittest.TestCase):
         session_1, session_2 = MagicMock(), MagicMock()
         new_driver.side_effect = [session_1, session_2]
         read_article.side_effect = process
-        rows = scan_items(validate_request({'articles': ['111', '222', '333']}))
+        rows = scan_items(validate_request({'articles': ['111', '222', '333']}), workers=1)
         self.assertEqual([r.price for r in rows], [500, 501, 502])
         self.assertEqual([r.status for r in rows], ['ok'] * 3)
         self.assertEqual([c.args[1].article for c in read_article.call_args_list],
@@ -162,7 +162,7 @@ class TestScraper(unittest.TestCase):
     def test_reject_multiple_pvz_even_from_direct_call(self):
         items = validate_request({'articles': ['123']}) + validate_request({'articles': ['456'], 'pvz_url': ALT})
         with self.assertRaises(ValueError):
-            scan_items(items)
+            scan_items(items, workers=1)
 
 
 class TestExcel(unittest.TestCase):
