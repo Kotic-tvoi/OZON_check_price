@@ -4,7 +4,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import time
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -14,9 +13,11 @@ LOG = logging.getLogger("ozon.scraper")
 HOME = "https://www.ozon.ru/"
 PAGE_TIMEOUT = int(os.getenv("OZON_PAGE_TIMEOUT", "30"))
 PRICE_WAIT = float(os.getenv("OZON_PRICE_WAIT", "4"))
-# At most one fresh-browser restart if the whole batch encounters CAPTCHA.
-CAPTCHA_BATCH_RESTARTS = 1
-CAPTCHA_RESTART_PAUSE_SECONDS = 3
+# Five total attempts per package. Fresh Chrome each time; no fixed sleep.
+MAX_BATCH_ATTEMPTS = 5
+RETRYABLE_BATCH_STATUSES = frozenset(
+    ("blocked", "skipped_blocked", "pvz_error", "pvz_unverified")
+)
 PRICE_XPATHS = (
     ("webPrice", "//*[contains(@data-widget,'webPrice')]//span[contains(.,'₽')]"),
     ("legacy", "//span[contains(@class,'tsHeadline600Large') and contains(.,'₽')]"),
@@ -191,33 +192,37 @@ def set_pvz(driver, pvz_url: str, explicit_address: str | None = None) -> str:
         if is_blocked(driver):
             raise BlockedError("Ozon продолжает показывать CAPTCHA на странице ПВЗ") from exc
         raise PickupPointError("Не найдена кнопка «Сохранить адрес и перейти к покупкам»") from exc
-    # An early click can be ignored while the geo page is still initializing.
-    # Retry only if the page remained unchanged and the original control is visible.
+    # Ozon can save the PVZ in a single-page transition without changing /geo/.
+    # Stop waiting as soon as the button disappears or the URL changes.
+    def after_click(d):
+        if "/geo/" not in d.current_url:
+            return "navigated"
+        visible = [el for el in d.find_elements(By.XPATH, xpath)
+                   if el.is_displayed() and el.is_enabled()]
+        if not visible:
+            return "submitted"
+        return False
+
     for attempt in range(2):
         button.click()
         try:
-            WebDriverWait(driver, 3 if attempt == 0 else 5, poll_frequency=0.2).until(
-                lambda d: "/geo/" not in d.current_url
-            )
+            state = WebDriverWait(driver, 1.5, poll_frequency=0.15).until(after_click)
             break
         except TimeoutException as exc:
             if is_blocked(driver):
                 raise BlockedError("Ozon продолжает показывать CAPTCHA при выборе ПВЗ") from exc
             if attempt == 1:
-                raise PickupPointError(
-                    "После нажатия «Сохранить адрес» Ozon не перешёл к покупкам. "
-                    f"Текущий URL: {driver.current_url}"
-                ) from exc
+                raise PickupPointError("Кнопка выбора ПВЗ не реагирует на нажатие") from exc
             try:
-                button = WebDriverWait(driver, 2, poll_frequency=0.2).until(find_button)
+                button = WebDriverWait(driver, 0.7, poll_frequency=0.15).until(find_button)
             except TimeoutException as btn_exc:
-                raise PickupPointError(
-                    "После нажатия кнопка исчезла, но переход к покупкам не произошёл. "
-                    f"Текущий URL: {driver.current_url}"
-                ) from btn_exc
+                raise PickupPointError("Не удалось подтвердить применение ПВЗ после нажатия") from btn_exc
 
-    # Never navigate to the homepage as a fallback: it can silently reset the PVZ.
-    check_visible_pvz(driver, expected, timeout=6)
+    # If the button vanished but Ozon stayed on /geo/, visit the storefront.
+    # This is NOT proof of success: verify the selected address in the header.
+    if state == "submitted" and "/geo/" in driver.current_url:
+        driver.get(HOME)
+    check_visible_pvz(driver, expected, timeout=4)
     return expected
 
 
@@ -356,23 +361,33 @@ def read_article(driver, item: PriceItem, expected_address: str) -> PriceResult:
 
 
 def scan_pvz_group(pvz_url: str, items: list[PriceItem], headed: bool = False) -> list[PriceResult]:
-    """Retry the ENTIRE batch after CAPTCHA; publish no partial results from failed attempts.
+    """Up to five full-package attempts, always starting from the first SKU.
 
-    No prices are cached between attempts. Each attempt uses a fresh browser,
-    and persistent CAPTCHA returns only errors (never stale partial prices).
+    Completed earlier packages are unaffected. Failed-attempt prices are discarded.
+    CAPTCHA and PVZ-selection failures are retried in a fresh Chrome session,
+    without a mandatory pause. Persistent failures stop after the fifth attempt.
     """
-    for attempt in range(CAPTCHA_BATCH_RESTARTS + 1):
+    for attempt in range(1, MAX_BATCH_ATTEMPTS + 1):
+        LOG.info("ПВЗ %s: попытка пакета %d/%d (%d SKU)",
+                 pvz_url, attempt, MAX_BATCH_ATTEMPTS, len(items))
         results = _scan_pvz_group_once(pvz_url, items, headed=headed)
-        if not any(row.status in ("blocked", "skipped_blocked") for row in results):
+        failures = [row for row in results if row.status in RETRYABLE_BATCH_STATUSES]
+        if not failures:
             return results
-        if attempt == CAPTCHA_BATCH_RESTARTS:
-            return [PriceResult(index=item.index, article=item.article, pvz_url=item.pvz_url,
-                                checked_at=utc_now(), status="blocked",
-                                message="Ozon запрашивает CAPTCHA; пакет не завершён после повторного запуска")
-                    for item in items]
-        LOG.warning("CAPTCHA при проверке ПВЗ %s. Перезапускаем весь пакет (%d/%d)",
-                    pvz_url, attempt + 1, CAPTCHA_BATCH_RESTARTS)
-        time.sleep(CAPTCHA_RESTART_PAUSE_SECONDS)
+        if attempt < MAX_BATCH_ATTEMPTS:
+            LOG.warning("Попытка пакета %d/%d завершилась с %s. "
+                        "Закрываем Chrome и повторяем все %d SKU.",
+                        attempt, MAX_BATCH_ATTEMPTS, failures[0].status, len(items))
+            continue
+
+        last_error = failures[0]
+        LOG.error("Пакет не завершён после %d попыток; последний статус %s",
+                  MAX_BATCH_ATTEMPTS, last_error.status)
+        return [PriceResult(index=item.index, article=item.article, pvz_url=item.pvz_url,
+                            checked_at=utc_now(), status=last_error.status,
+                            message=f"Пакет не завершён после {MAX_BATCH_ATTEMPTS} попыток: "
+                                    f"{(last_error.message or last_error.status)[:190]}")
+                for item in items]
     raise AssertionError("Недостижимо")
 
 
