@@ -55,7 +55,7 @@ def create_driver(*, headed: bool = False):
     opts.add_argument("--no-proxy-server")
     if not headed:
         opts.add_argument("--headless=new")
-    opts.add_argument("--window-size=1440,960")
+    opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--disable-extensions")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -187,12 +187,33 @@ def set_pvz(driver, pvz_url: str, explicit_address: str | None = None) -> str:
         if is_blocked(driver):
             raise BlockedError("Ozon продолжает показывать CAPTCHA на странице ПВЗ") from exc
         raise PickupPointError("Не найдена кнопка «Сохранить адрес и перейти к покупкам»") from exc
-    button.click()
-    try:
-        WebDriverWait(driver, 10).until(lambda d: "/geo/" not in d.current_url)
-    except TimeoutException:
-        driver.get(HOME)
-    check_visible_pvz(driver, expected)
+    # An early click can be ignored while the geo page is still initializing.
+    # Retry only if the page remained unchanged and the original control is visible.
+    for attempt in range(2):
+        button.click()
+        try:
+            WebDriverWait(driver, 3 if attempt == 0 else 5, poll_frequency=0.2).until(
+                lambda d: "/geo/" not in d.current_url
+            )
+            break
+        except TimeoutException as exc:
+            if is_blocked(driver):
+                raise BlockedError("Ozon продолжает показывать CAPTCHA при выборе ПВЗ") from exc
+            if attempt == 1:
+                raise PickupPointError(
+                    "После нажатия «Сохранить адрес» Ozon не перешёл к покупкам. "
+                    f"Текущий URL: {driver.current_url}"
+                ) from exc
+            try:
+                button = WebDriverWait(driver, 2, poll_frequency=0.2).until(find_button)
+            except TimeoutException as btn_exc:
+                raise PickupPointError(
+                    "После нажатия кнопка исчезла, но переход к покупкам не произошёл. "
+                    f"Текущий URL: {driver.current_url}"
+                ) from btn_exc
+
+    # Never navigate to the homepage as a fallback: it can silently reset the PVZ.
+    check_visible_pvz(driver, expected, timeout=6)
     return expected
 
 
