@@ -55,12 +55,12 @@ class TestPvzSelection(unittest.TestCase):
         self.assertEqual(result, ADDRESS)
         driver.get.assert_called_once_with(PVZ)
         self.assertEqual(button.click.call_count, 1)
-        verify.assert_called_once_with(driver, ADDRESS, timeout=6)
+        verify.assert_called_once_with(driver, ADDRESS, timeout=4)
 
     def test_failed_selection_does_not_fallback_to_home(self):
         driver, button = self.make_driver(navigates=False)
         with patch.dict(sys.modules, selenium_modules()), patch('scraper.is_blocked', return_value=False):
-            with self.assertRaisesRegex(PickupPointError, 'не перешёл к покупкам'):
+            with self.assertRaisesRegex(PickupPointError, 'не реагирует на нажатие'):
                 set_pvz(driver, PVZ, ADDRESS)
         driver.get.assert_called_once_with(PVZ)
         self.assertEqual(button.click.call_count, 2)
