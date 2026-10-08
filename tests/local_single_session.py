@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One Chrome, one PVZ, up to 100 SKUs; no packages, DB or saved price files."""
+"""One HTTP-style request, up to two parallel Chrome sessions, no batches."""
 from __future__ import annotations
 
 import argparse
@@ -24,6 +24,8 @@ def main():
     parser.add_argument("--sku-file", type=Path, default=ROOT / "SKU_Ozon.txt")
     parser.add_argument("--pvz", default=DEFAULT_PVZ)
     parser.add_argument("--headed", action="store_true")
+    parser.add_argument("--workers", choices=[1, 2], type=int, default=2,
+                        help="Compare one vs two parallel Chromes (default 2)")
     args = parser.parse_args()
 
     if not 1 <= args.limit <= MAX_ITEMS:
@@ -37,10 +39,10 @@ def main():
         parser.error("No SKUs in selected range")
 
     items = [PriceItem(index=i, article=sku, pvz_url=url) for i, sku in enumerate(articles)]
-    print(f"One browser request: {len(items)} SKUs; PVZ: {url}", flush=True)
+    print(f"One request: {len(items)} SKUs; browsers: {min(args.workers, len(items))}; PVZ: {url}", flush=True)
     print("In case of a confirmed block, the entire request may be retried in a fresh Chrome.", flush=True)
     started = time.perf_counter()
-    results = scan_items(items, headed=args.headed)
+    results = scan_items(items, headed=args.headed, workers=args.workers)
     elapsed = time.perf_counter() - started
 
     counts = Counter()
