@@ -1,0 +1,305 @@
+"""On-demand, read-only Selenium scraping. Browser lives only during each request."""
+from __future__ import annotations
+
+import logging
+import os
+import re
+from dataclasses import dataclass
+
+from core import PriceItem, PriceResult, utc_now
+
+LOG = logging.getLogger("ozon.scraper")
+HOME = "https://www.ozon.ru/"
+PAGE_TIMEOUT = int(os.getenv("OZON_PAGE_TIMEOUT", "30"))
+PRICE_XPATHS = (
+    ("webPrice", "//*[contains(@data-widget,'webPrice')]//span[contains(.,'₽')]"),
+    ("legacy", "//span[contains(@class,'tsHeadline600Large') and contains(.,'₽')]"),
+)
+CARD_LABEL = re.compile(r"(?:с\s+ozon\s*картой|ozon\s*карта|ozon\s*картой|озон\s*картой)", re.I)
+BLOCK_PHRASES = ("проверка безопасности", "доступ ограничен", "подтвердите, что вы не робот", "captcha")
+IGNORE_ADDRESS_TOKENS = {
+    "россия", "москва", "санкт", "петербург", "город", "область", "улица", "ул", "пункт",
+    "пункте", "озон", "ozon", "пвз", "проспект", "шоссе", "пр", "д", "дом", "корпус",
+}
+
+
+class PickupPointError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class PriceCandidate:
+    price: int
+    source: str
+    near_text: str
+    card_label: bool
+
+
+def create_driver(*, headed: bool = False):
+    # Selenium Manager finds/downloads ChromeDriver automatically when needed.
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    opts = Options()
+    if not headed:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--window-size=1440,960")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_experimental_option("prefs", {"profile.managed_default_content_settings.images": 2})
+    opts.page_load_strategy = "eager"
+    binary = os.getenv("OZON_CHROME_BINARY", "").strip()
+    if binary:
+        opts.binary_location = binary
+    driver = webdriver.Chrome(options=opts)
+    driver.set_page_load_timeout(PAGE_TIMEOUT)
+    return driver
+
+
+def _text_tokens(text: str) -> list[str]:
+    return re.findall(r"[а-яёa-z0-9]+", text.casefold())
+
+
+def _identity_parts(address: str) -> tuple[list[str], str]:
+    """Conservatively identify street word and house number from geo-page address."""
+    text = address.casefold()
+    # Example: Россия, Москва, Палехская улица, 21
+    houses = re.findall(r"\b\d+(?:[а-я])?(?:к\d+)?\b", text)
+    words = [word for word in _text_tokens(text) if len(word) >= 5 and word not in IGNORE_ADDRESS_TOKENS]
+    if not houses or not words:
+        raise PickupPointError(f"Не удалось выделить улицу и дом из адреса: {address!r}")
+    return words, houses[-1]
+
+
+def address_matches(address: str, visible_ui: str) -> bool:
+    """Require street and house within one short visible location UI segment."""
+    try:
+        words, house = _identity_parts(address)
+    except PickupPointError:
+        return False
+    for segment in re.split(r"[\n|]", visible_ui.casefold()):
+        normalized = " ".join(_text_tokens(segment))
+        for word in words:
+            pos = normalized.find(word)
+            if pos >= 0 and re.search(rf"\b{re.escape(house)}\b", normalized[pos:pos+110]):
+                return True
+    return False
+
+
+def geo_page_address(driver) -> str | None:
+    """Try to read the destination address from the official geo landing page."""
+    title = (driver.title or "").strip()
+    # Ozon page titles: 'Пункт Ozon: Россия, Москва, Палехская улица, 21 - ...'
+    match = re.search(r"пункт\s+ozon\s*:\s*(.+?)(?:\s+-\s+|\s+—\s+|$)", title, re.I)
+    if match:
+        address = match.group(1).strip()
+        try:
+            _identity_parts(address)
+            return address
+        except PickupPointError:
+            pass
+    return None
+
+
+def visible_location_text(driver) -> str:
+    """Read only visible header/navigation address controls; not the geo page body."""
+    return driver.execute_script("""
+        const nodes = document.querySelectorAll(
+          'header, [data-widget*="Header"], [data-widget*="header"],'
+          + '[data-widget*="Address"], [data-widget*="address"],'
+          + '[data-widget*="Location"], [data-widget*="location"]');
+        const result = [];
+        for (const el of nodes) {
+          const rect = el.getBoundingClientRect();
+          if (!rect.width || !rect.height) continue;
+          const txt = (el.innerText || '').trim();
+          if (txt && txt.length < 3000) result.push(txt);
+        }
+        for (const el of document.querySelectorAll('button,a')) {
+          const rect = el.getBoundingClientRect();
+          if (!rect.width || !rect.height || rect.top > 250 || rect.bottom < 0) continue;
+          const txt = (el.innerText || '').trim();
+          if (txt && txt.length < 180) result.push(txt);
+        }
+        return result.join(' | ').slice(0,15000);
+    """) or ""
+
+
+def check_visible_pvz(driver, expected_address: str, *, timeout: int = 12):
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.common.exceptions import TimeoutException
+    if "/geo/" in driver.current_url:
+        raise PickupPointError("Не удалось выйти со страницы ПВЗ")
+    try:
+        WebDriverWait(driver, timeout, poll_frequency=0.5).until(
+            lambda d: address_matches(expected_address, visible_location_text(d)))
+    except TimeoutException as exc:
+        txt = visible_location_text(driver)[:230].replace("\n", " ")
+        raise PickupPointError(f"ПВЗ не подтверждён в шапке Ozon: {txt!r}") from exc
+
+
+def set_pvz(driver, pvz_url: str, explicit_address: str | None = None) -> str:
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.common.exceptions import TimeoutException
+    driver.get(pvz_url)
+    if explicit_address:
+        expected = explicit_address
+    else:
+        try:
+            expected = WebDriverWait(driver, 12).until(lambda d: geo_page_address(d))
+        except TimeoutException:
+            expected = None
+    if not expected:
+        raise PickupPointError("Ozon не сообщил адрес ПВЗ на geo-странице; передайте pvz_address")
+    xpath = ("//*[self::button or self::a or @role='button']"
+             "[contains(normalize-space(.),'Сохранить адрес') and contains(normalize-space(.),'покупкам')]")
+    try:
+        button = WebDriverWait(driver, 18, poll_frequency=0.5).until(
+            lambda d: next((x for x in d.find_elements(By.XPATH, xpath) if x.is_displayed() and x.is_enabled()), False))
+    except TimeoutException as exc:
+        raise PickupPointError("Не найдена кнопка «Сохранить адрес и перейти к покупкам»") from exc
+    button.click()
+    try:
+        WebDriverWait(driver, 10).until(lambda d: "/geo/" not in d.current_url)
+    except TimeoutException:
+        driver.get(HOME)
+    check_visible_pvz(driver, expected)
+    return expected
+
+
+def price_as_int(text: str) -> int | None:
+    if not text:
+        return None
+    cleaned = text.replace("\u2009", " ").replace("\xa0", " ").replace("\u202f", " ")
+    match = re.fullmatch(r"\s*([0-9][0-9 ]*)\s*₽?\s*", cleaned)
+    return int(match.group(1).replace(" ", "")) if match else None
+
+
+def collect_candidates(driver) -> list[PriceCandidate]:
+    """Read visible prices only. We don't assume the first price is Ozon Card price."""
+    from selenium.webdriver.common.by import By
+    out: list[PriceCandidate] = []
+    keys: set[tuple[str, int]] = set()
+    for source, xpath in PRICE_XPATHS:
+        for el in driver.find_elements(By.XPATH, xpath):
+            if not el.is_displayed():
+                continue
+            value = price_as_int(el.text.strip())
+            if value is None or (source, value) in keys:
+                continue
+            keys.add((source, value))
+            try:
+                # Smaller ancestor text is more dependable than a whole price widget.
+                nearby = el.find_element(By.XPATH, "./..").text.strip()[:160]
+            except Exception:
+                nearby = ""
+            # This is only a tentative label, not enough to claim that Ozon Card pricing is verified.
+            out.append(PriceCandidate(value, source, nearby, bool(CARD_LABEL.search(nearby))))
+    return out[:20]
+
+
+def is_blocked(driver) -> bool:
+    try:
+        from selenium.webdriver.common.by import By
+        body = driver.find_element(By.TAG_NAME, "body").text[:2000].casefold()
+        return any(phrase in body for phrase in BLOCK_PHRASES)
+    except Exception:
+        return False
+
+
+def read_article(driver, item: PriceItem, expected_address: str) -> PriceResult:
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.common.by import By
+    result = PriceResult(index=item.index, article=item.article, pvz_url=item.pvz_url,
+                         pvz_address=expected_address, checked_at=utc_now())
+    url = f"https://www.ozon.ru/product/{item.article}/"
+    for attempt in range(2):
+        try:
+            driver.get(url)
+            if is_blocked(driver):
+                result.status = "blocked"
+                result.message = "Ozon запросил проверку доступа"
+                return result
+            # Always confirm PVZ on product page before trusting any price.
+            check_visible_pvz(driver, expected_address, timeout=5)
+            WebDriverWait(driver, 10, poll_frequency=0.5).until(
+                lambda d: bool(collect_candidates(d)) or is_blocked(d))
+            if is_blocked(driver):
+                result.status = "blocked"
+                result.message = "Ozon запросил проверку доступа"
+                return result
+            candidates = collect_candidates(driver)
+            if candidates:
+                # We intentionally publish a DISPLAYED price, not a falsely guaranteed Ozon Card price.
+                chosen = next((c for c in candidates if c.source == "webPrice"), candidates[0])
+                result.price = chosen.price
+                result.price_type = "unverified"  # Explicit label needs a real cross-check.
+                result.status = "ok_unverified_price_type"
+                result.source = chosen.source
+                result.checked_at = utc_now()
+                return result
+            result.status = "no_price"
+            result.message = "Видимая цена не найдена"
+        except PickupPointError as exc:
+            result.status = "pvz_unverified"
+            result.message = str(exc)
+            return result
+        except Exception as exc:
+            result.status = "error"
+            result.message = f"{type(exc).__name__}: {str(exc)[:160]}"
+            LOG.warning("SKU %s: попытка %d: %s", item.article, attempt + 1, result.message)
+    return result
+
+
+def scan_pvz_group(pvz_url: str, items: list[PriceItem], headed: bool = False) -> list[PriceResult]:
+    """One browser reused for all SKUs at the same PVZ; always closed after request."""
+    driver = None
+    try:
+        driver = create_driver(headed=headed)
+        expected_values = {item.pvz_address for item in items if item.pvz_address}
+        if len(expected_values) > 1:
+            raise PickupPointError("Для одного ПВЗ заданы разные ожидаемые адреса")
+        expected = set_pvz(driver, pvz_url, next(iter(expected_values), None))
+        return [read_article(driver, item, expected) for item in items]
+    except Exception as exc:
+        LOG.warning("ПВЗ %s: %s", pvz_url, exc)
+        return [PriceResult(index=item.index, article=item.article, pvz_url=item.pvz_url,
+                            pvz_address=item.pvz_address, checked_at=utc_now(),
+                            status="pvz_error", message=f"{type(exc).__name__}: {str(exc)[:230]}")
+                for item in items]
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                LOG.warning("Не удалось закрыть Chrome", exc_info=True)
+
+
+def scan_items(items: list[PriceItem], headed: bool = False) -> list[PriceResult]:
+    """One request = one pickup point, one browser, any number of SKUs."""
+    if not items:
+        return []
+    pvz_url = items[0].pvz_url
+    if any(item.pvz_url != pvz_url for item in items):
+        raise ValueError("В одном запросе разрешён только один ПВЗ")
+    return sorted(scan_pvz_group(pvz_url, items, headed), key=lambda result: result.index)
+
+
+def diagnose_price(item: PriceItem, headed: bool = False) -> dict:
+    """Manual price audit; no screenshots or history are stored automatically."""
+    driver = None
+    try:
+        driver = create_driver(headed=headed)
+        expected = set_pvz(driver, item.pvz_url, item.pvz_address)
+        driver.get(f"https://www.ozon.ru/product/{item.article}/")
+        check_visible_pvz(driver, expected, timeout=6)
+        from selenium.webdriver.support.ui import WebDriverWait
+        WebDriverWait(driver, 12).until(lambda d: bool(collect_candidates(d)) or is_blocked(d))
+        candidates = [c.__dict__ for c in collect_candidates(driver)]
+        return {"article": item.article, "pvz_url": item.pvz_url, "pvz_address": expected,
+                "candidates": candidates, "blocked": is_blocked(driver),
+                "warning": "Только диагностические кандидаты; требуется сверка с ценой на витрине Ozon"}
+    finally:
+        if driver is not None:
+            driver.quit()

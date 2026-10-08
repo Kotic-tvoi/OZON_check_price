@@ -1,5 +1,10 @@
-.vscode
-reports
-venv
-env
+__pycache__/
+.vscode/
+venv/
+.env
+reports/
+*.xlsx
 ozon_session.json
+*.pyc
+*.log
+.pytest_cache/
