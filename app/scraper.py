@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -13,6 +14,9 @@ LOG = logging.getLogger("ozon.scraper")
 HOME = "https://www.ozon.ru/"
 PAGE_TIMEOUT = int(os.getenv("OZON_PAGE_TIMEOUT", "30"))
 PRICE_WAIT = float(os.getenv("OZON_PRICE_WAIT", "4"))
+# At most one fresh-browser restart if the whole batch encounters CAPTCHA.
+CAPTCHA_BATCH_RESTARTS = 1
+CAPTCHA_RESTART_PAUSE_SECONDS = 3
 PRICE_XPATHS = (
     ("webPrice", "//*[contains(@data-widget,'webPrice')]//span[contains(.,'₽')]"),
     ("legacy", "//span[contains(@class,'tsHeadline600Large') and contains(.,'₽')]"),
@@ -352,7 +356,28 @@ def read_article(driver, item: PriceItem, expected_address: str) -> PriceResult:
 
 
 def scan_pvz_group(pvz_url: str, items: list[PriceItem], headed: bool = False) -> list[PriceResult]:
-    """One browser reused for all SKUs at the same PVZ; always closed after request."""
+    """Retry the ENTIRE batch after CAPTCHA; publish no partial results from failed attempts.
+
+    No prices are cached between attempts. Each attempt uses a fresh browser,
+    and persistent CAPTCHA returns only errors (never stale partial prices).
+    """
+    for attempt in range(CAPTCHA_BATCH_RESTARTS + 1):
+        results = _scan_pvz_group_once(pvz_url, items, headed=headed)
+        if not any(row.status in ("blocked", "skipped_blocked") for row in results):
+            return results
+        if attempt == CAPTCHA_BATCH_RESTARTS:
+            return [PriceResult(index=item.index, article=item.article, pvz_url=item.pvz_url,
+                                checked_at=utc_now(), status="blocked",
+                                message="Ozon запрашивает CAPTCHA; пакет не завершён после повторного запуска")
+                    for item in items]
+        LOG.warning("CAPTCHA при проверке ПВЗ %s. Перезапускаем весь пакет (%d/%d)",
+                    pvz_url, attempt + 1, CAPTCHA_BATCH_RESTARTS)
+        time.sleep(CAPTCHA_RESTART_PAUSE_SECONDS)
+    raise AssertionError("Недостижимо")
+
+
+def _scan_pvz_group_once(pvz_url: str, items: list[PriceItem], headed: bool = False) -> list[PriceResult]:
+    """One attempt: one Chrome and one PVZ for every SKU in the package."""
     driver = None
     try:
         driver = create_driver(headed=headed)
