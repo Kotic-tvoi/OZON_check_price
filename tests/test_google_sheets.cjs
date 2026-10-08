@@ -34,6 +34,7 @@ const sheet = {
 const documentProperties = new Map();
 const calls = [];
 let simulateBlock = false;
+let simulateUnavailable = false;
 const context = {
   LockService: {getDocumentLock: () => ({tryLock: () => true, releaseLock: () => {}})},
   SpreadsheetApp: {
@@ -57,7 +58,10 @@ const context = {
     calls.push({url,payload});
     return {
       getContentText: () => JSON.stringify({pvz_url: payload.pvz_url, results: payload.articles.map((article,index) => ({
-        article,price:simulateBlock && index === 1 ? null : 100+index, status:simulateBlock && index === 1 ? 'blocked' : 'ok'
+        article,
+        price: (simulateBlock || simulateUnavailable) && index === 1 ? null : 100+index,
+        status: simulateBlock && index === 1 ? 'blocked' :
+                simulateUnavailable && index === 1 ? 'unavailable' : 'ok'
       }))}),
       getResponseCode: () => 200
     };
@@ -87,3 +91,11 @@ assert.equal(values.get('B3'), '');
 assert.equal(documentProperties.get('OZON_PRICE_NEXT_ROW'), '3');
 assert.equal(calls.length, 2);
 console.log('Apps Script block/pause test OK: resumes at blocked row.');
+
+// A truly unavailable item is displayed as text, not a fake numeric zero.
+simulateBlock = false;
+simulateUnavailable = true;
+context.ozonStart();
+assert.equal(values.get('B2'), 100);
+assert.equal(values.get('B3'), 'Нет данных');
+console.log('Apps Script no-data test OK: unavailable -> Нет данных.');
