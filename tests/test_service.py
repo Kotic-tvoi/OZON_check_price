@@ -115,26 +115,23 @@ class TestScraper(unittest.TestCase):
                 pvz_url=item.pvz_url, status='blocked' if item.index == 1 else 'ok',
                 price=None if item.index == 1 else 100)
         read_article.side_effect = process
-        with patch('scraper.time.sleep') as sleep:
-            results = scan_items(validate_request({'articles': ['111', '222', '333', '444']}))
+        results = scan_items(validate_request({'articles': ['111', '222', '333', '444']}))
         # The first successful price is discarded with the failed attempt.
         self.assertEqual([r.status for r in results], ['blocked'] * 4)
         self.assertEqual([r.price for r in results], [None] * 4)
         self.assertEqual([c.args[1].article for c in read_article.call_args_list],
-                         ['111', '222', '111', '222'])
-        self.assertEqual(new_driver.call_count, 2)
-        self.assertEqual(new_driver.return_value.quit.call_count, 2)
-        sleep.assert_called_once()
+                         ['111', '222'] * 5)
+        self.assertEqual(new_driver.call_count, 5)
+        self.assertEqual(new_driver.return_value.quit.call_count, 5)
 
     @patch('scraper.set_pvz', side_effect=BlockedError('Captcha'))
     @patch('scraper.create_driver')
     def test_block_on_pvz_stops_entire_batch(self, new_driver, set_pvz):
         new_driver.return_value = MagicMock()
-        with patch('scraper.time.sleep'):
-            results = scan_items(validate_request({'articles': ['111', '222']}))
+        results = scan_items(validate_request({'articles': ['111', '222']}))
         self.assertEqual([r.status for r in results], ['blocked', 'blocked'])
-        self.assertEqual(set_pvz.call_count, 2)
-        self.assertEqual(new_driver.return_value.quit.call_count, 2)
+        self.assertEqual(set_pvz.call_count, 5)
+        self.assertEqual(new_driver.return_value.quit.call_count, 5)
 
     @patch('scraper.read_article')
     @patch('scraper.set_pvz', return_value='Москва, Палехская улица, 21')
@@ -154,8 +151,7 @@ class TestScraper(unittest.TestCase):
         session_1, session_2 = MagicMock(), MagicMock()
         new_driver.side_effect = [session_1, session_2]
         read_article.side_effect = process
-        with patch('scraper.time.sleep'):
-            rows = scan_items(validate_request({'articles': ['111', '222', '333']}))
+        rows = scan_items(validate_request({'articles': ['111', '222', '333']}))
         self.assertEqual([r.price for r in rows], [500, 501, 502])
         self.assertEqual([r.status for r in rows], ['ok'] * 3)
         self.assertEqual([c.args[1].article for c in read_article.call_args_list],
