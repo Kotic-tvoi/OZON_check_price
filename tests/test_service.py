@@ -115,18 +115,53 @@ class TestScraper(unittest.TestCase):
                 pvz_url=item.pvz_url, status='blocked' if item.index == 1 else 'ok',
                 price=None if item.index == 1 else 100)
         read_article.side_effect = process
-        results = scan_items(validate_request({'articles': ['111', '222', '333', '444']}))
-        self.assertEqual([r.status for r in results], ['ok', 'blocked', 'skipped_blocked', 'skipped_blocked'])
-        self.assertEqual(read_article.call_count, 2)
-        self.assertEqual(new_driver.return_value.quit.call_count, 1)
+        with patch('scraper.time.sleep') as sleep:
+            results = scan_items(validate_request({'articles': ['111', '222', '333', '444']}))
+        # The first successful price is discarded with the failed attempt.
+        self.assertEqual([r.status for r in results], ['blocked'] * 4)
+        self.assertEqual([r.price for r in results], [None] * 4)
+        self.assertEqual([c.args[1].article for c in read_article.call_args_list],
+                         ['111', '222', '111', '222'])
+        self.assertEqual(new_driver.call_count, 2)
+        self.assertEqual(new_driver.return_value.quit.call_count, 2)
+        sleep.assert_called_once()
 
     @patch('scraper.set_pvz', side_effect=BlockedError('Captcha'))
     @patch('scraper.create_driver')
     def test_block_on_pvz_stops_entire_batch(self, new_driver, set_pvz):
         new_driver.return_value = MagicMock()
-        results = scan_items(validate_request({'articles': ['111', '222']}))
+        with patch('scraper.time.sleep'):
+            results = scan_items(validate_request({'articles': ['111', '222']}))
         self.assertEqual([r.status for r in results], ['blocked', 'blocked'])
-        self.assertEqual(new_driver.return_value.quit.call_count, 1)
+        self.assertEqual(set_pvz.call_count, 2)
+        self.assertEqual(new_driver.return_value.quit.call_count, 2)
+
+    @patch('scraper.read_article')
+    @patch('scraper.set_pvz', return_value='Москва, Палехская улица, 21')
+    @patch('scraper.create_driver')
+    def test_captcha_restarts_entire_batch_without_reusing_prices(self, new_driver, set_pvz, read_article):
+        new_driver.side_effect = [MagicMock(), MagicMock()]
+        def process(driver, item, address):
+            # On first session, SKU 111 succeeds but SKU 222 triggers CAPTCHA.
+            # Test session identity against the two recorded mocked browsers.
+            if driver is session_1 and item.index == 1:
+                return PriceResult(index=item.index, article=item.article,
+                                   pvz_url=item.pvz_url, status='blocked')
+            price = (100 if driver is session_1 else 500) + item.index
+            return PriceResult(index=item.index, article=item.article,
+                               pvz_url=item.pvz_url, price=price, status='ok')
+        # Build explicit fake sessions for an easily observable restart.
+        session_1, session_2 = MagicMock(), MagicMock()
+        new_driver.side_effect = [session_1, session_2]
+        read_article.side_effect = process
+        with patch('scraper.time.sleep'):
+            rows = scan_items(validate_request({'articles': ['111', '222', '333']}))
+        self.assertEqual([r.price for r in rows], [500, 501, 502])
+        self.assertEqual([r.status for r in rows], ['ok'] * 3)
+        self.assertEqual([c.args[1].article for c in read_article.call_args_list],
+                         ['111', '222', '111', '222', '333'])
+        self.assertEqual(session_1.quit.call_count, 1)
+        self.assertEqual(session_2.quit.call_count, 1)
 
     def test_reject_multiple_pvz_even_from_direct_call(self):
         items = validate_request({'articles': ['123']}) + validate_request({'articles': ['456'], 'pvz_url': ALT})
@@ -145,6 +180,18 @@ class TestExcel(unittest.TestCase):
             ns = {'x': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
             self.assertEqual(root.find('.//x:c[@r="A2"]/x:is/x:t', ns).text, '000123')
             self.assertEqual(root.find('.//x:c[@r="B2"]/x:v', ns).text, '350')
+
+    def test_missing_price_shows_no_data_but_captcha_is_blank(self):
+        result_rows = [
+            PriceResult(index=0, article='111', pvz_url=MOSCOW, status='unavailable'),
+            PriceResult(index=1, article='222', pvz_url=MOSCOW, status='blocked'),
+        ]
+        output = to_xlsx(result_rows)
+        with zipfile.ZipFile(io.BytesIO(output)) as workbook:
+            root = ET.fromstring(workbook.read('xl/worksheets/sheet1.xml'))
+        ns = {'x': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+        self.assertEqual(root.find('.//x:c[@r="B2"]/x:is/x:t', ns).text, 'Нет данных')
+        self.assertIsNone(root.find('.//x:c[@r="B3"]', ns))
 
 
 class TestServer(unittest.TestCase):
