@@ -152,6 +152,10 @@ function ozonContinue() {
             throw new Error('Нарушен исходный порядок артикулов в ответе API');
           if (item.price != null && /^ok/.test(item.status || '')) {
             values[positions[j]] = [item.price];
+          } else if (item.status === 'unavailable' || item.status === 'no_price') {
+            // The item is unavailable or has no visible price, not a CAPTCHA.
+            values[positions[j]] = ['Нет данных'];
+            errors++;
           } else if (item.status === 'blocked' || item.status === 'skipped_blocked' || item.status === 'pvz_unverified' || item.status === 'pvz_error') {
             if (blockedPosition < 0) blockedPosition = positions[j];
           } else { errors++; }
