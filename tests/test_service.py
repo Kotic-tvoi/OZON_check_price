@@ -14,7 +14,7 @@ from xml.etree import ElementTree as ET
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'app'))
 
 from core import InputError, PriceResult, normalize_pvz_url, validate_request
-from scraper import address_matches, geo_page_address, price_as_int, scan_items
+from scraper import address_matches, geo_page_address, price_as_int, scan_items, product_redirected, is_blocked, BlockedError
 from xlsx_export import to_xlsx
 from server import APIHandler, ThreadingHTTPServer
 
@@ -83,13 +83,50 @@ class TestScraper(unittest.TestCase):
         set_pvz.return_value = 'Москва, Палехская улица, 21'
         read_article.side_effect = lambda drv, item, address: PriceResult(
             index=item.index, article=item.article, pvz_url=item.pvz_url, price=200,
-            status='ok_unverified_price_type')
+            status='ok')
         items = validate_request({'articles': ['123', '456', '789']})
         results = scan_items(items)
         self.assertEqual([r.price for r in results], [200, 200, 200])
         self.assertEqual(new_driver.call_count, 1)
         self.assertEqual(driver.quit.call_count, 1)
         self.assertEqual(read_article.call_count, 3)
+
+    def test_redirected_search_has_no_product_price(self):
+        driver = MagicMock()
+        driver.current_url = 'https://www.ozon.ru/search/?text=Расческа&product_id=380174557'
+        self.assertTrue(product_redirected(driver, '380174557'))
+        driver.current_url = 'https://www.ozon.ru/product/380174557/'
+        self.assertFalse(product_redirected(driver, '380174557'))
+
+    def test_antibot_title_detected_without_visible_body(self):
+        driver = MagicMock()
+        driver.title = 'Antibot Captcha'
+        driver.execute_script.return_value = ''
+        self.assertTrue(is_blocked(driver))
+
+    @patch('scraper.read_article')
+    @patch('scraper.set_pvz')
+    @patch('scraper.create_driver')
+    def test_block_stops_later_skus(self, new_driver, set_pvz, read_article):
+        new_driver.return_value = MagicMock()
+        set_pvz.return_value = 'Москва, Палехская улица, 21'
+        def process(d, item, address):
+            return PriceResult(index=item.index, article=item.article,
+                pvz_url=item.pvz_url, status='blocked' if item.index == 1 else 'ok',
+                price=None if item.index == 1 else 100)
+        read_article.side_effect = process
+        results = scan_items(validate_request({'articles': ['111', '222', '333', '444']}))
+        self.assertEqual([r.status for r in results], ['ok', 'blocked', 'skipped_blocked', 'skipped_blocked'])
+        self.assertEqual(read_article.call_count, 2)
+        self.assertEqual(new_driver.return_value.quit.call_count, 1)
+
+    @patch('scraper.set_pvz', side_effect=BlockedError('Captcha'))
+    @patch('scraper.create_driver')
+    def test_block_on_pvz_stops_entire_batch(self, new_driver, set_pvz):
+        new_driver.return_value = MagicMock()
+        results = scan_items(validate_request({'articles': ['111', '222']}))
+        self.assertEqual([r.status for r in results], ['blocked', 'blocked'])
+        self.assertEqual(new_driver.return_value.quit.call_count, 1)
 
     def test_reject_multiple_pvz_even_from_direct_call(self):
         items = validate_request({'articles': ['123']}) + validate_request({'articles': ['456'], 'pvz_url': ALT})
@@ -100,7 +137,7 @@ class TestScraper(unittest.TestCase):
 class TestExcel(unittest.TestCase):
     def test_optional_excel_in_memory(self):
         output = to_xlsx([PriceResult(index=0, article='000123', pvz_url=MOSCOW, price=350,
-                                      status='ok_unverified_price_type')])
+                                      status='ok')])
         self.assertTrue(output.startswith(b'PK'))
         with zipfile.ZipFile(io.BytesIO(output)) as workbook:
             xml = workbook.read('xl/worksheets/sheet1.xml')
@@ -150,13 +187,13 @@ class TestServer(unittest.TestCase):
     @patch('scraper.scan_items')
     def test_prices_api_and_no_persistence(self, scan):
         scan.return_value = [PriceResult(index=0, article='123', pvz_url=MOSCOW,
-                                         price=500, status='ok_unverified_price_type')]
+                                         price=500, status='ok')]
         with self.post('/v1/prices', {'pvz_url': MOSCOW, 'articles': ['123']}, 'test-api-token') as response:
             result = json.load(response)
         self.assertEqual(result['results'][0]['price'], 500)
         self.assertEqual(result['pvz_url'], MOSCOW)
         self.assertNotIn('pvz_url', result['results'][0])
-        self.assertEqual(result['summary']['verified_ozon_card_prices'], 0)
+        self.assertNotIn('verified_ozon_card_prices', result['summary'])
         scan.assert_called_once()
         self.assertEqual({x.pvz_url for x in scan.call_args.args[0]}, {MOSCOW})
 
@@ -168,7 +205,7 @@ class TestServer(unittest.TestCase):
     @patch('scraper.scan_items')
     def test_multiple_articles_same_pvz(self, scan):
         scan.return_value = [PriceResult(index=index, article=article, pvz_url=ALT, price=100 + index,
-                                         status='ok_unverified_price_type')
+                                         status='ok')
                              for index, article in enumerate(['123', '456'])]
         with self.post('/v1/prices', {'pvz_url': ALT, 'articles': ['123', '456']}, 'test-api-token') as response:
             result = json.load(response)

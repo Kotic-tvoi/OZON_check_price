@@ -5,7 +5,7 @@
  * Только ручной запуск из меню. Без триггеров и сохранения цен на сервере.
  */
 const OZ_SHEET_NAME = 'Цены Ozon';
-const OZ_BATCH = 8; // Один browser session на пакет; уменьшите при таймаутах.
+const OZ_BATCH = 16; // Начальный тестовый размер; можно изменить после замеров.
 const OZ_MAX_RUNTIME_MS = 230000;
 const OZ_CURSOR = 'OZON_PRICE_NEXT_ROW';
 const OZ_RUN_PVZ = 'OZON_PRICE_RUN_PVZ';
@@ -129,7 +129,9 @@ function ozonContinue() {
     const started = Date.now();
     let errors = Number(doc.getProperty(OZ_ERRORS) || 0);
     let processed = Number(doc.getProperty(OZ_PROCESSED) || 0);
+    let pausedByBlock = false;
     while (nextRow <= lastRow && Date.now() - started < OZ_MAX_RUNTIME_MS) {
+      const batchStartRow = nextRow;
       const count = Math.min(OZ_BATCH, lastRow - nextRow + 1);
       const input = sheet.getRange(nextRow, 1, count, 1).getDisplayValues();
       const articles = [], positions = [];
@@ -138,6 +140,7 @@ function ozonContinue() {
         if (sku) { articles.push(sku); positions.push(i); }
       }
       const values = Array.from({length: count}, () => ['']);
+      let blockedPosition = -1;
       if (articles.length) {
         // Один pvz_url на весь пакет — НЕ по одному URL на SKU.
         const res = ozonFetch_('/v1/prices', {pvz_url: url, articles: articles});
@@ -149,16 +152,24 @@ function ozonContinue() {
             throw new Error('Нарушен исходный порядок артикулов в ответе API');
           if (item.price != null && /^ok/.test(item.status || '')) {
             values[positions[j]] = [item.price];
+          } else if (item.status === 'blocked' || item.status === 'skipped_blocked' || item.status === 'pvz_unverified' || item.status === 'pvz_error') {
+            if (blockedPosition < 0) blockedPosition = positions[j];
           } else { errors++; }
         }
-        processed += articles.length;
+        processed += blockedPosition < 0 ? articles.length : articles.filter((_, i) => positions[i] < blockedPosition).length;
       }
       // Если цена не получена, ячейка остаётся пустой, старая цена не сохраняется.
       sheet.getRange(nextRow, 2, count, 1).setValues(values);
-      nextRow += count;
+      nextRow = blockedPosition >= 0 ? batchStartRow + blockedPosition : batchStartRow + count;
+      if (blockedPosition >= 0) pausedByBlock = true;
       doc.setProperties({[OZ_CURSOR]: String(nextRow), [OZ_ERRORS]: String(errors),
         [OZ_PROCESSED]: String(processed)});
       SpreadsheetApp.flush();
+      if (pausedByBlock) break;
+    }
+    if (pausedByBlock) {
+      SpreadsheetApp.getUi().alert('Ozon запросил проверку доступа. Сбор остановлен. Продолжите позже через меню.');
+      return;
     }
     if (nextRow > lastRow) {
       doc.deleteProperty(OZ_CURSOR); doc.deleteProperty(OZ_RUN_PVZ);

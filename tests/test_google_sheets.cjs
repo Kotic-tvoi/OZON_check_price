@@ -33,6 +33,7 @@ const sheet = {
 };
 const documentProperties = new Map();
 const calls = [];
+let simulateBlock = false;
 const context = {
   LockService: {getDocumentLock: () => ({tryLock: () => true, releaseLock: () => {}})},
   SpreadsheetApp: {
@@ -56,7 +57,7 @@ const context = {
     calls.push({url,payload});
     return {
       getContentText: () => JSON.stringify({pvz_url: payload.pvz_url, results: payload.articles.map((article,index) => ({
-        article,price:100+index,price_type:'unverified',status:'ok_unverified_price_type'
+        article,price:simulateBlock && index === 1 ? null : 100+index, status:simulateBlock && index === 1 ? 'blocked' : 'ok'
       }))}),
       getResponseCode: () => 200
     };
@@ -77,3 +78,12 @@ assert.equal(values.get('A1'), 'Артикул товара');
 assert.equal(values.get('B1'), 'Конечная цена');
 assert.equal(values.get('H2'),'https://www.ozon.ru/geo/moskva/442329/');
 console.log('Apps Script smoke test OK: one PVZ, 2 SKU, columns A/B only.');
+
+// After a CAPTCHA the worksheet must pause, leaving the first blocked SKU as the next resume point.
+simulateBlock = true;
+context.ozonStart();
+assert.equal(values.get('B2'), 100);
+assert.equal(values.get('B3'), '');
+assert.equal(documentProperties.get('OZON_PRICE_NEXT_ROW'), '3');
+assert.equal(calls.length, 2);
+console.log('Apps Script block/pause test OK: resumes at blocked row.');

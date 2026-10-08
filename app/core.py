@@ -55,7 +55,6 @@ class PriceResult:
     article: str
     pvz_url: str
     price: int | None = None
-    price_type: str = "unknown"
     status: str = "error"
     pvz_address: str | None = None
     checked_at: str | None = None
