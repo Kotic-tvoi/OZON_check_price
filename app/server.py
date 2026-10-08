@@ -107,7 +107,6 @@ class APIHandler(BaseHTTPRequestHandler):
                     'summary': {
                         'total': len(result_rows),
                         'found': sum(r.price is not None for r in result_rows),
-                        'verified_ozon_card_prices': sum(r.price_type == 'ozon_card_verified' for r in result_rows),
                     },
                     # One PVZ at the root, no repeated link for each SKU in JSON.
                     'results': [{key: value for key, value in r.to_dict().items() if key != 'pvz_url'}
