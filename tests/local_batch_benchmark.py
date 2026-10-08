@@ -43,7 +43,9 @@ def main():
         results = scan_items(items, headed=args.headed)
         for row in results:
             counters[row.status] += 1
-            print(f'{row.article}: {row.price if row.price is not None else "null"} | {row.status}'
+            display_price = (row.price if row.price is not None else
+                             'Нет данных' if row.status in {'unavailable', 'no_price'} else 'null')
+            print(f'{row.article}: {display_price} | {row.status}'
                   + (f' | {row.message}' if row.message else ''), flush=True)
         print(f'Package seconds: {time.perf_counter() - begun:.2f}', flush=True)
         if any(r.status in {'blocked', 'skipped_blocked', 'pvz_unverified', 'pvz_error'} for r in results):
