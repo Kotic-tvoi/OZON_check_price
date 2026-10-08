@@ -141,19 +141,19 @@ def visible_location_text(driver) -> str:
 def check_visible_pvz(driver, expected_address: str, *, timeout: int = 8):
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.common.exceptions import TimeoutException
-    if is_blocked(driver):
-        raise BlockedError("Ozon показывает CAPTCHA/ограничение доступа")
+    # Ozon may initially report an anti-bot title for an otherwise loading page.
+    # Wait for real header content, rather than rejecting the first title.
     if "/geo/" in driver.current_url:
         raise PickupPointError("Не удалось выйти со страницы ПВЗ")
 
     def address_ready(d):
-        if is_blocked(d):
-            raise BlockedError("Ozon показывает CAPTCHA/ограничение доступа")
         return address_matches(expected_address, visible_location_text(d))
 
     try:
-        WebDriverWait(driver, timeout, poll_frequency=0.25).until(address_ready)
+        WebDriverWait(driver, timeout, poll_frequency=0.2).until(address_ready)
     except TimeoutException as exc:
+        if is_blocked(driver):
+            raise BlockedError("Ozon продолжает показывать CAPTCHA/ограничение доступа") from exc
         txt = visible_location_text(driver)[:230].replace("\n", " ")
         raise PickupPointError(f"ПВЗ не подтверждён в шапке Ozon: {txt!r}") from exc
 
@@ -163,18 +163,17 @@ def set_pvz(driver, pvz_url: str, explicit_address: str | None = None) -> str:
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.common.exceptions import TimeoutException
     driver.get(pvz_url)
-    if is_blocked(driver):
-        raise BlockedError("Ozon показывает CAPTCHA/ограничение доступа на странице ПВЗ")
+    # A transient Antibot Challenge Page must not stop the run on its first frame.
     if explicit_address:
         expected = explicit_address
     else:
         try:
             def geo_ready(d):
-                if is_blocked(d):
-                    raise BlockedError("Ozon показывает CAPTCHA/ограничение доступа на странице ПВЗ")
                 return geo_page_address(d)
-            expected = WebDriverWait(driver, 8, poll_frequency=0.25).until(geo_ready)
-        except TimeoutException:
+            expected = WebDriverWait(driver, 8, poll_frequency=0.2).until(geo_ready)
+        except TimeoutException as exc:
+            if is_blocked(driver):
+                raise BlockedError("Ozon продолжает показывать CAPTCHA на странице ПВЗ") from exc
             expected = None
     if not expected:
         raise PickupPointError("Ozon не сообщил адрес ПВЗ на geo-странице; передайте pvz_address")
@@ -182,11 +181,11 @@ def set_pvz(driver, pvz_url: str, explicit_address: str | None = None) -> str:
              "[contains(normalize-space(.),'Сохранить адрес') and contains(normalize-space(.),'покупкам')]")
     try:
         def find_button(d):
-            if is_blocked(d):
-                raise BlockedError("Ozon показывает CAPTCHA/ограничение доступа")
             return next((x for x in d.find_elements(By.XPATH, xpath) if x.is_displayed() and x.is_enabled()), False)
-        button = WebDriverWait(driver, 12, poll_frequency=0.25).until(find_button)
+        button = WebDriverWait(driver, 12, poll_frequency=0.2).until(find_button)
     except TimeoutException as exc:
+        if is_blocked(driver):
+            raise BlockedError("Ozon продолжает показывать CAPTCHA на странице ПВЗ") from exc
         raise PickupPointError("Не найдена кнопка «Сохранить адрес и перейти к покупкам»") from exc
     button.click()
     try:
@@ -270,8 +269,8 @@ def read_article(driver, item: PriceItem, expected_address: str) -> PriceResult:
     url = f"https://www.ozon.ru/product/{item.article}/"
     try:
         driver.get(url)
-        if is_blocked(driver):
-            raise BlockedError("Ozon запросил проверку доступа")
+        # A brief anti-bot interstitial can appear before the product page renders.
+        # Check real page content and the selected pickup point before deciding.
         if product_redirected(driver, item.article):
             result.status = "unavailable"
             result.message = "Ozon перенаправил с карточки товара; цена похожих предложений не учитывается"
@@ -282,11 +281,9 @@ def read_article(driver, item: PriceItem, expected_address: str) -> PriceResult:
             result.message = "Товар недоступен для выбранного ПВЗ"
             return result
         # Check selected pickup point before accepting any value.
-        check_visible_pvz(driver, expected_address, timeout=4)
+        check_visible_pvz(driver, expected_address, timeout=6)
 
         def price_or_terminal(d):
-            if is_blocked(d):
-                raise BlockedError("Ozon запросил проверку доступа")
             if product_redirected(d, item.article):
                 return "unavailable"
             page = visible_body_excerpt(d).casefold()
@@ -296,8 +293,11 @@ def read_article(driver, item: PriceItem, expected_address: str) -> PriceResult:
             return candidates if candidates else False
 
         try:
-            state = WebDriverWait(driver, PRICE_WAIT, poll_frequency=0.25).until(price_or_terminal)
+            state = WebDriverWait(driver, PRICE_WAIT, poll_frequency=0.2).until(price_or_terminal)
         except TimeoutException:
+            # Classify persistent access restrictions only after waiting for the price.
+            if is_blocked(driver):
+                raise BlockedError("Ozon продолжает показывать CAPTCHA на карточке товара")
             state = None
         if state == "unavailable":
             result.status = "unavailable"
