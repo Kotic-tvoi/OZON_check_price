@@ -5,6 +5,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 from core import PriceItem, PriceResult, utc_now
@@ -13,11 +14,11 @@ LOG = logging.getLogger("ozon.scraper")
 HOME = "https://www.ozon.ru/"
 PAGE_TIMEOUT = int(os.getenv("OZON_PAGE_TIMEOUT", "30"))
 PRICE_WAIT = float(os.getenv("OZON_PRICE_WAIT", "4"))
-# Five total attempts per package. Fresh Chrome each time; no fixed sleep.
+# Five total attempts per independent browser subset; each retry starts at its first SKU.
 MAX_BATCH_ATTEMPTS = 5
-RETRYABLE_BATCH_STATUSES = frozenset(
-    ("blocked", "skipped_blocked", "pvz_error", "pvz_unverified")
-)
+RETRYABLE_BATCH_STATUSES = frozenset(('blocked', 'skipped_blocked', 'pvz_error', 'pvz_unverified'))
+# Persistent (not transient) interstitials require a short wait before classifying failure.
+PVZ_READY_TIMEOUT = 4.5
 PRICE_XPATHS = (
     ("webPrice", "//*[contains(@data-widget,'webPrice')]//span[contains(.,'₽')]"),
     ("legacy", "//span[contains(@class,'tsHeadline600Large') and contains(.,'₽')]"),
@@ -164,65 +165,59 @@ def check_visible_pvz(driver, expected_address: str, *, timeout: int = 8):
 
 
 def set_pvz(driver, pvz_url: str, explicit_address: str | None = None) -> str:
+    """Select one PVZ; defer costly header confirmation to the first product.
+
+    We use the existing tab for products (driver.get), never close/open tabs.
+    Selection is confirmed on the product page before accepting any price.
+    """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.common.exceptions import TimeoutException
+
     driver.get(pvz_url)
-    # A transient Antibot Challenge Page must not stop the run on its first frame.
-    if explicit_address:
-        expected = explicit_address
-    else:
-        try:
-            def geo_ready(d):
-                return geo_page_address(d)
-            expected = WebDriverWait(driver, 8, poll_frequency=0.2).until(geo_ready)
-        except TimeoutException as exc:
-            if is_blocked(driver):
-                raise BlockedError("Ozon продолжает показывать CAPTCHA на странице ПВЗ") from exc
-            expected = None
-    if not expected:
-        raise PickupPointError("Ozon не сообщил адрес ПВЗ на geo-странице; передайте pvz_address")
     xpath = ("//*[self::button or self::a or @role='button']"
              "[contains(normalize-space(.),'Сохранить адрес') and contains(normalize-space(.),'покупкам')]")
+
+    # The Ozon title and button can arrive in either order. Check both in one wait.
+    def ready(d):
+        address = explicit_address or geo_page_address(d)
+        if not address:
+            return False
+        button = next((el for el in d.find_elements(By.XPATH, xpath)
+                       if el.is_displayed() and el.is_enabled()), None)
+        return (address, button) if button else False
+
     try:
-        def find_button(d):
-            return next((x for x in d.find_elements(By.XPATH, xpath) if x.is_displayed() and x.is_enabled()), False)
-        button = WebDriverWait(driver, 12, poll_frequency=0.2).until(find_button)
+        expected, button = WebDriverWait(driver, PVZ_READY_TIMEOUT, poll_frequency=0.15).until(ready)
     except TimeoutException as exc:
         if is_blocked(driver):
-            raise BlockedError("Ozon продолжает показывать CAPTCHA на странице ПВЗ") from exc
-        raise PickupPointError("Не найдена кнопка «Сохранить адрес и перейти к покупкам»") from exc
-    # Ozon can save the PVZ in a single-page transition without changing /geo/.
-    # Stop waiting as soon as the button disappears or the URL changes.
-    def after_click(d):
-        if "/geo/" not in d.current_url:
-            return "navigated"
+            raise BlockedError('Ozon продолжает показывать CAPTCHA на странице ПВЗ') from exc
+        raise PickupPointError('Не удалось дождаться адреса или кнопки выбора ПВЗ') from exc
+
+    # Ozon can save the PVZ without changing /geo/. Wait only until the click
+    # visibly takes effect; never wait for a mandatory full-page navigation.
+    def click_applied(d):
+        if '/geo/' not in d.current_url:
+            return True
         visible = [el for el in d.find_elements(By.XPATH, xpath)
                    if el.is_displayed() and el.is_enabled()]
-        if not visible:
-            return "submitted"
-        return False
+        return not visible
 
     for attempt in range(2):
         button.click()
         try:
-            state = WebDriverWait(driver, 1.5, poll_frequency=0.15).until(after_click)
+            WebDriverWait(driver, 1.2, poll_frequency=0.15).until(click_applied)
             break
         except TimeoutException as exc:
             if is_blocked(driver):
-                raise BlockedError("Ozon продолжает показывать CAPTCHA при выборе ПВЗ") from exc
-            if attempt == 1:
-                raise PickupPointError("Кнопка выбора ПВЗ не реагирует на нажатие") from exc
-            try:
-                button = WebDriverWait(driver, 0.7, poll_frequency=0.15).until(find_button)
-            except TimeoutException as btn_exc:
-                raise PickupPointError("Не удалось подтвердить применение ПВЗ после нажатия") from btn_exc
+                raise BlockedError('Ozon продолжает показывать CAPTCHA при выборе ПВЗ') from exc
+            if attempt:
+                raise PickupPointError('Ozon не подтвердил нажатие кнопки выбора ПВЗ') from exc
+            # The early click can be ignored while the geo page is initializing.
+            button = WebDriverWait(driver, 0.6, poll_frequency=0.15).until(ready)[1]
 
-    # If the button vanished but Ozon stayed on /geo/, visit the storefront.
-    # This is NOT proof of success: verify the selected address in the header.
-    if state == "submitted" and "/geo/" in driver.current_url:
-        driver.get(HOME)
-    check_visible_pvz(driver, expected, timeout=4)
+    # No homepage navigation and no additional tab. The first product verifies
+    # the actual saved address before returning any price.
     return expected
 
 
@@ -301,17 +296,18 @@ def read_article(driver, item: PriceItem, expected_address: str) -> PriceResult:
         driver.get(url)
         # A brief anti-bot interstitial can appear before the product page renders.
         # Check real page content and the selected pickup point before deciding.
+        # Verify the PVZ on the actual product/search page, in the same tab.
+        # This also waits for any transient anti-bot interstitial to resolve.
+        check_visible_pvz(driver, expected_address, timeout=4)
         if product_redirected(driver, item.article):
-            result.status = "unavailable"
-            result.message = "Ozon перенаправил с карточки товара; цена похожих предложений не учитывается"
+            result.status = 'unavailable'
+            result.message = 'Ozon перенаправил с карточки товара; цена похожих предложений не учитывается'
             return result
         body = visible_body_excerpt(driver).casefold()
         if any(phrase in body for phrase in UNAVAILABLE_PHRASES):
-            result.status = "unavailable"
-            result.message = "Товар недоступен для выбранного ПВЗ"
+            result.status = 'unavailable'
+            result.message = 'Товар недоступен для выбранного ПВЗ'
             return result
-        # Check selected pickup point before accepting any value.
-        check_visible_pvz(driver, expected_address, timeout=6)
 
         def price_or_terminal(d):
             if product_redirected(d, item.article):
@@ -361,34 +357,24 @@ def read_article(driver, item: PriceItem, expected_address: str) -> PriceResult:
 
 
 def scan_pvz_group(pvz_url: str, items: list[PriceItem], headed: bool = False) -> list[PriceResult]:
-    """Up to five full-package attempts, always starting from the first SKU.
-
-    Completed earlier packages are unaffected. Failed-attempt prices are discarded.
-    CAPTCHA and PVZ-selection failures are retried in a fresh Chrome session,
-    without a mandatory pause. Persistent failures stop after the fifth attempt.
-    """
+    """Up to 5 attempts for THIS half only. No result is reused across attempts."""
     for attempt in range(1, MAX_BATCH_ATTEMPTS + 1):
-        LOG.info("ПВЗ %s: попытка пакета %d/%d (%d SKU)",
-                 pvz_url, attempt, MAX_BATCH_ATTEMPTS, len(items))
+        LOG.info('Subset %s..%s attempt %d/%d', items[0].index, items[-1].index,
+                 attempt, MAX_BATCH_ATTEMPTS)
         results = _scan_pvz_group_once(pvz_url, items, headed=headed)
-        failures = [row for row in results if row.status in RETRYABLE_BATCH_STATUSES]
-        if not failures:
+        failed = next((r for r in results if r.status in RETRYABLE_BATCH_STATUSES), None)
+        if failed is None:
             return results
         if attempt < MAX_BATCH_ATTEMPTS:
-            LOG.warning("Попытка пакета %d/%d завершилась с %s. "
-                        "Закрываем Chrome и повторяем все %d SKU.",
-                        attempt, MAX_BATCH_ATTEMPTS, failures[0].status, len(items))
+            LOG.warning('Retry subset starting at SKU %s (%s), attempt %d/%d',
+                        items[0].article, failed.status, attempt + 1, MAX_BATCH_ATTEMPTS)
             continue
-
-        last_error = failures[0]
-        LOG.error("Пакет не завершён после %d попыток; последний статус %s",
-                  MAX_BATCH_ATTEMPTS, last_error.status)
         return [PriceResult(index=item.index, article=item.article, pvz_url=item.pvz_url,
-                            checked_at=utc_now(), status=last_error.status,
-                            message=f"Пакет не завершён после {MAX_BATCH_ATTEMPTS} попыток: "
-                                    f"{(last_error.message or last_error.status)[:190]}")
+                            checked_at=utc_now(), status=failed.status,
+                            message=f'Часть списка не обработана после {MAX_BATCH_ATTEMPTS} попыток: '
+                                    f'{(failed.message or failed.status)[:180]}')
                 for item in items]
-    raise AssertionError("Недостижимо")
+    raise AssertionError('Недостижимо')
 
 
 def _scan_pvz_group_once(pvz_url: str, items: list[PriceItem], headed: bool = False) -> list[PriceResult]:
@@ -426,14 +412,29 @@ def _scan_pvz_group_once(pvz_url: str, items: list[PriceItem], headed: bool = Fa
                 LOG.warning("Не удалось закрыть Chrome", exc_info=True)
 
 
-def scan_items(items: list[PriceItem], headed: bool = False) -> list[PriceResult]:
-    """One request = one pickup point, one browser, any number of SKUs."""
+def scan_items(items: list[PriceItem], headed: bool = False, *, workers: int = 2) -> list[PriceResult]:
+    """Two independent concurrent Chromes, one PVZ and up to 100 SKUs overall.
+
+    Each Chrome handles a contiguous half of the input sequentially. A blocked
+    session restarts only its own half (up to 5 full attempts), never the other.
+    No persistent DB, cookies, cache or price files are created.
+    """
     if not items:
         return []
     pvz_url = items[0].pvz_url
     if any(item.pvz_url != pvz_url for item in items):
-        raise ValueError("В одном запросе разрешён только один ПВЗ")
-    return sorted(scan_pvz_group(pvz_url, items, headed), key=lambda result: result.index)
+        raise ValueError('В одном запросе разрешён только один ПВЗ')
+    if workers not in (1, 2):
+        raise ValueError('Число браузеров должно быть 1 или 2')
+    if workers == 1 or len(items) == 1:
+        return sorted(scan_pvz_group(pvz_url, items, headed), key=lambda result: result.index)
+    halfway = (len(items) + 1) // 2
+    subsets = (items[:halfway], items[halfway:])
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix='ozon-chrome') as pool:
+        tasks = [pool.submit(scan_pvz_group, pvz_url, subset, headed) for subset in subsets]
+        # Collect in submission order; both are already running concurrently.
+        results = [row for task in tasks for row in task.result()]
+    return sorted(results, key=lambda result: result.index)
 
 
 def diagnose_price(item: PriceItem, headed: bool = False) -> dict:
