@@ -13,6 +13,9 @@ ADDRESS = 'Россия, Москва, Палехская улица, 21'
 class FakeTimeoutException(Exception):
     pass
 
+class FakeStaleElementReferenceException(Exception):
+    pass
+
 class ImmediateWait:
     '''Synchronous stand-in for Selenium polling, no network or delays.'''
     def __init__(self, driver, timeout, poll_frequency=None):
@@ -33,6 +36,7 @@ def selenium_modules():
     mods['selenium.webdriver.common.by'].By = types.SimpleNamespace(XPATH='xpath')
     mods['selenium.webdriver.support.ui'].WebDriverWait = ImmediateWait
     mods['selenium.common.exceptions'].TimeoutException = FakeTimeoutException
+    mods['selenium.common.exceptions'].StaleElementReferenceException = FakeStaleElementReferenceException
     return mods
 
 class TestPvzSelection(unittest.TestCase):
@@ -56,6 +60,24 @@ class TestPvzSelection(unittest.TestCase):
         driver.get.assert_called_once_with(PVZ)
         self.assertEqual(button.click.call_count, 1)
         verify.assert_not_called()
+
+    def test_stale_button_after_click_is_not_fatal(self):
+        driver, button = self.make_driver(navigates=False)
+        # The first lookup succeeds; Ozon removes the node after the click.
+        driver.find_elements.side_effect = [[button], []]
+        with patch.dict(sys.modules, selenium_modules()):
+            result = set_pvz(driver, PVZ, ADDRESS)
+        self.assertEqual(result, ADDRESS)
+        self.assertEqual(button.click.call_count, 1)
+
+    def test_stale_reference_during_polling_is_retried(self):
+        driver, button = self.make_driver(navigates=True)
+        stale = MagicMock()
+        stale.is_displayed.side_effect = FakeStaleElementReferenceException()
+        driver.find_elements.side_effect = [[stale, button]]
+        with patch.dict(sys.modules, selenium_modules()):
+            result = set_pvz(driver, PVZ, ADDRESS)
+        self.assertEqual(result, ADDRESS)
 
     def test_no_home_navigation_without_url_change(self):
         driver, button = self.make_driver(navigates=False)
