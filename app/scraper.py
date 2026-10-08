@@ -165,59 +165,90 @@ def check_visible_pvz(driver, expected_address: str, *, timeout: int = 8):
 
 
 def set_pvz(driver, pvz_url: str, explicit_address: str | None = None) -> str:
-    """Select one PVZ; defer costly header confirmation to the first product.
+    """Apply a PVZ in the existing tab. The next page verifies its address.
 
-    We use the existing tab for products (driver.get), never close/open tabs.
-    Selection is confirmed on the product page before accepting any price.
+    Ozon can replace the button's DOM node immediately after a click. Treat
+    stale-element references as an in-progress re-render, not a hard failure.
     """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.common.exceptions import TimeoutException
+    from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
 
     driver.get(pvz_url)
     xpath = ("//*[self::button or self::a or @role='button']"
              "[contains(normalize-space(.),'Сохранить адрес') and contains(normalize-space(.),'покупкам')]")
 
-    # The Ozon title and button can arrive in either order. Check both in one wait.
     def ready(d):
         address = explicit_address or geo_page_address(d)
         if not address:
             return False
-        button = next((el for el in d.find_elements(By.XPATH, xpath)
-                       if el.is_displayed() and el.is_enabled()), None)
-        return (address, button) if button else False
+        for el in d.find_elements(By.XPATH, xpath):
+            try:
+                if el.is_displayed() and el.is_enabled():
+                    return (address, el)
+            except StaleElementReferenceException:
+                # Ozon rebuilt the button; poll for a fresh reference.
+                continue
+        return False
 
     try:
-        expected, button = WebDriverWait(driver, PVZ_READY_TIMEOUT, poll_frequency=0.15).until(ready)
+        expected, button = WebDriverWait(
+            driver, PVZ_READY_TIMEOUT, poll_frequency=0.15
+        ).until(ready)
     except TimeoutException as exc:
         if is_blocked(driver):
-            raise BlockedError('Ozon продолжает показывать CAPTCHA на странице ПВЗ') from exc
-        raise PickupPointError('Не удалось дождаться адреса или кнопки выбора ПВЗ') from exc
+            raise BlockedError("Ozon продолжает показывать CAPTCHA на странице ПВЗ") from exc
+        raise PickupPointError("Не удалось дождаться адреса или кнопки выбора ПВЗ") from exc
 
-    # Ozon can save the PVZ without changing /geo/. Wait only until the click
-    # visibly takes effect; never wait for a mandatory full-page navigation.
     def click_applied(d):
-        if '/geo/' not in d.current_url:
+        # A navigation is a positive signal. If still on /geo/, check a fresh
+        # DOM snapshot instead of accessing the old button reference.
+        if "/geo/" not in d.current_url:
             return True
-        visible = [el for el in d.find_elements(By.XPATH, xpath)
-                   if el.is_displayed() and el.is_enabled()]
-        return not visible
+        for el in d.find_elements(By.XPATH, xpath):
+            try:
+                if el.is_displayed() and el.is_enabled():
+                    return False
+            except StaleElementReferenceException:
+                # The page is still changing. Try the next 150 ms poll.
+                return False
+        return True
 
     for attempt in range(2):
-        button.click()
+        try:
+            button.click()
+        except StaleElementReferenceException:
+            # The click may have triggered the re-render; do not count this
+            # as a CAPTCHA or assume that the selected address was saved.
+            if click_applied(driver):
+                break
+            if attempt:
+                raise PickupPointError("Кнопка выбора ПВЗ устарела после повторного поиска")
+            try:
+                expected, button = WebDriverWait(
+                    driver, 0.8, poll_frequency=0.15
+                ).until(ready)
+            except TimeoutException as exc:
+                raise PickupPointError("Не удалось повторно найти кнопку выбора ПВЗ") from exc
+            continue
+
         try:
             WebDriverWait(driver, 1.2, poll_frequency=0.15).until(click_applied)
             break
         except TimeoutException as exc:
             if is_blocked(driver):
-                raise BlockedError('Ozon продолжает показывать CAPTCHA при выборе ПВЗ') from exc
+                raise BlockedError("Ozon продолжает показывать CAPTCHA при выборе ПВЗ") from exc
             if attempt:
-                raise PickupPointError('Ozon не подтвердил нажатие кнопки выбора ПВЗ') from exc
-            # The early click can be ignored while the geo page is initializing.
-            button = WebDriverWait(driver, 0.6, poll_frequency=0.15).until(ready)[1]
+                raise PickupPointError("Ozon не подтвердил нажатие кнопки выбора ПВЗ") from exc
+            try:
+                expected, button = WebDriverWait(
+                    driver, 0.8, poll_frequency=0.15
+                ).until(ready)
+            except TimeoutException as find_exc:
+                raise PickupPointError("Не удалось повторно найти кнопку выбора ПВЗ") from find_exc
 
-    # No homepage navigation and no additional tab. The first product verifies
-    # the actual saved address before returning any price.
+    # No extra tab and no redundant homepage load. The caller verifies the
+    # actual selected address on the storefront before accepting prices.
     return expected
 
 
