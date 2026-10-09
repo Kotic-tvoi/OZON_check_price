@@ -1,487 +1,280 @@
-"""On-demand, read-only Selenium scraping. Browser lives only during each request."""
+"""Read prices from one Ozon seller catalog; never visit individual product pages."""
 from __future__ import annotations
 
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse
 
-from core import PriceItem, PriceResult, utc_now
+from core import DEFAULT_PVZ, DEFAULT_STORE, pvz_url, store_url
 
-LOG = logging.getLogger("ozon.scraper")
-HOME = "https://www.ozon.ru/"
-PAGE_TIMEOUT = int(os.getenv("OZON_PAGE_TIMEOUT", "30"))
-PRICE_WAIT = float(os.getenv("OZON_PRICE_WAIT", "4"))
-# Five total attempts per independent browser subset; each retry starts at its first SKU.
-MAX_BATCH_ATTEMPTS = 5
-RETRYABLE_BATCH_STATUSES = frozenset(('blocked', 'skipped_blocked', 'pvz_error', 'pvz_unverified'))
-# Persistent (not transient) interstitials require a short wait before classifying failure.
-PVZ_READY_TIMEOUT = 4.5
-PRICE_XPATHS = (
-    ("webPrice", "//*[contains(@data-widget,'webPrice')]//span[contains(.,'₽')]"),
-    ("legacy", "//span[contains(@class,'tsHeadline600Large') and contains(.,'₽')]"),
-)
-BLOCK_PHRASES = (
-    "проверка безопасности", "доступ ограничен", "подтвердите, что вы не робот",
-    "captcha", "antibot captcha", "сопоставьте пазл", "двигая ползунок",
-    "похоже, нет соединения",
-)
-UNAVAILABLE_PHRASES = ("не доставляется в ваш регион", "товара нет в наличии", "товар закончился")
-IGNORE_ADDRESS_TOKENS = {
-    "россия", "москва", "санкт", "петербург", "город", "область", "улица", "ул", "пункт",
-    "пункте", "озон", "ozon", "пвз", "проспект", "шоссе", "пр", "д", "дом", "корпус",
+LOG = logging.getLogger('ozon.storefront')
+
+# The container is Ozon's seller catalog, not its recommendation section.
+EXTRACT = r"""
+const root = document.querySelector('#contentScrollPaginator');
+if (!root) return {ready:false,items:[],boundary:false,visible:0};
+const items = [];
+for (const tile of root.querySelectorAll('.tile-root')) {
+  const a = tile.querySelector('a[href*="/product/"]');
+  if (!a) continue;
+  let path;
+  try { path = new URL(a.href).pathname; } catch { continue; }
+  const id = path.match(/(?:-|\/)(\d{7,12})\/?$/)?.[1];
+  if (!id) continue;
+  // Prefer the current displayed price, not the crossed-out old price.
+  const priceNode = tile.querySelector('.c35_6_0-a0 span.c35_6_0-a1') ||
+    [...tile.querySelectorAll('span')].find(s =>
+      /^\s*[\d\s\u2009\u202f\u00a0]+\s*₽\s*$/.test(s.textContent||'') &&
+      !s.closest('s,del,[style*="line-through"]'));
+  const digits = (priceNode?.textContent||'').replace(/\D/g,'');
+  items.push({article:id,price:digits?Number(digits):null});
 }
+const header = [...document.querySelectorAll('h1,h2,h3,span')]
+  .find(el => el.textContent?.trim() === 'Возможно, вам понравится');
+const boundary = !!header && header.getBoundingClientRect().top <= innerHeight;
+const rootBottom = root.getBoundingClientRect().bottom;
+return {ready:true,items,boundary,visible:root.querySelectorAll('.tile-root').length,
+        end_visible:rootBottom <= innerHeight,scroll_y:scrollY};
+"""
+
+SCROLL = r"""
+const root = document.querySelector('#contentScrollPaginator');
+if (!root) return;
+const cards = root.querySelectorAll('.tile-root');
+(cards.length ? cards[cards.length-1] : root).scrollIntoView({block:'end',behavior:'instant'});
+"""
 
 
-class PickupPointError(RuntimeError):
+class AccessError(RuntimeError):
     pass
 
 
-class BlockedError(PickupPointError):
-    """Ozon showed a human verification or access restriction; do not retry automatically."""
+class CatalogError(RuntimeError):
     pass
 
 
-@dataclass(frozen=True)
-class PriceCandidate:
-    price: int
-    source: str
-    near_text: str
+@dataclass
+class Catalog:
+    store_url: str
+    pvz_url: str
+    pvz_address: str
+    items: list[dict]
+    complete: bool
+    elapsed_seconds: float
+
+    def as_dict(self) -> dict:
+        return {
+            'store_url': self.store_url, 'pvz_url': self.pvz_url,
+            'pvz_address': self.pvz_address, 'complete': self.complete,
+            'summary': {'total': len(self.items),
+                        'with_price': sum(x['price'] is not None for x in self.items)},
+            'items': self.items,
+        }
 
 
-def create_driver(*, headed: bool = False):
-    # Selenium Manager finds/downloads ChromeDriver automatically when needed.
+def create_driver(headed: bool = False):
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
-    opts = Options()
-    # Configuration that was successful in the user's local Selenium test.
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--no-proxy-server")
+    options = Options()
     if not headed:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--disable-extensions")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_experimental_option("prefs", {"profile.managed_default_content_settings.images": 2})
-    opts.page_load_strategy = "eager"
-    binary = os.getenv("OZON_CHROME_BINARY", "").strip()
-    if binary:
-        opts.binary_location = binary
-    driver = webdriver.Chrome(options=opts)
-    driver.set_page_load_timeout(PAGE_TIMEOUT)
+        options.add_argument('--headless=new')
+    options.add_argument('--window-size=1920,1080')
+    options.add_argument('--disable-blink-features=AutomationControlled')
+    options.add_argument('--no-proxy-server')
+    options.add_argument('--disable-extensions')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_experimental_option('prefs', {
+        'profile.managed_default_content_settings.images': 2,
+    })
+    options.page_load_strategy = 'eager'
+    if os.getenv('OZON_CHROME_BINARY'):
+        options.binary_location = os.environ['OZON_CHROME_BINARY']
+    driver = webdriver.Chrome(options=options)
+    driver.set_page_load_timeout(30)
     return driver
 
 
-def _text_tokens(text: str) -> list[str]:
-    return re.findall(r"[а-яёa-z0-9]+", text.casefold())
-
-
-def _identity_parts(address: str) -> tuple[list[str], str]:
-    """Conservatively identify street word and house number from geo-page address."""
-    text = address.casefold()
-    # Example: Россия, Москва, Палехская улица, 21
-    houses = re.findall(r"\b\d+(?:[а-я])?(?:к\d+)?\b", text)
-    words = [word for word in _text_tokens(text) if len(word) >= 5 and word not in IGNORE_ADDRESS_TOKENS]
-    if not houses or not words:
-        raise PickupPointError(f"Не удалось выделить улицу и дом из адреса: {address!r}")
-    return words, houses[-1]
-
-
-def address_matches(address: str, visible_ui: str) -> bool:
-    """Require street and house within one short visible location UI segment."""
+def is_blocked(driver) -> bool:
     try:
-        words, house = _identity_parts(address)
-    except PickupPointError:
+        title = (driver.title or '').lower()
+        if 'captcha' in title or 'antibot' in title:
+            return True
+        text = driver.execute_script(
+            "return (document.body?.innerText||'').slice(0,1500).toLowerCase()") or ''
+        return any(word in text for word in ('сопоставьте пазл', 'двигая ползунок',
+                                             'подтвердите, что вы не робот',
+                                             'похоже, нет соединения'))
+    except Exception:
         return False
-    for segment in re.split(r"[\n|]", visible_ui.casefold()):
-        normalized = " ".join(_text_tokens(segment))
-        for word in words:
-            pos = normalized.find(word)
-            if pos >= 0 and re.search(rf"\b{re.escape(house)}\b", normalized[pos:pos+110]):
-                return True
-    return False
 
 
-def geo_page_address(driver) -> str | None:
-    """Try to read the destination address from the official geo landing page."""
-    title = (driver.title or "").strip()
-    # Ozon page titles: 'Пункт Ozon: Россия, Москва, Палехская улица, 21 - ...'
-    match = re.search(r"пункт\s+ozon\s*:\s*(.+?)(?:\s+-\s+|\s+—\s+|$)", title, re.I)
-    if match:
-        address = match.group(1).strip()
-        try:
-            _identity_parts(address)
-            return address
-        except PickupPointError:
-            pass
-    return None
+def _address(title: str) -> str | None:
+    match = re.search(r'пункт\s+ozon\s*:\s*(.+?)(?:\s+-\s+|\s+—\s+|$)', title, re.I)
+    return match.group(1).strip() if match else None
 
 
-def visible_location_text(driver) -> str:
-    """Read only visible header/navigation address controls; not the geo page body."""
+def _matches(address: str, header: str) -> bool:
+    # Require identifiable street and house; city-only matches are unsafe.
+    tokens = re.findall(r'[а-яёa-z0-9]+', address.casefold())
+    words = [x for x in tokens if len(x) >= 5 and x not in
+             {'россия','москва','петербург','санкт','улица','озон','ozon','область','пункт'}]
+    numbers = re.findall(r'\b\d+[а-я]?\b', address.casefold())
+    if not words or not numbers:
+        return False
+    normalized = ' '.join(re.findall(r'[а-яёa-z0-9]+', header.casefold()))
+    return any(word in normalized and re.search(rf'\b{re.escape(numbers[-1])}\b', normalized)
+               for word in words)
+
+
+def _header_text(driver) -> str:
     return driver.execute_script("""
-        const nodes = document.querySelectorAll(
-          'header, [data-widget*="Header"], [data-widget*="header"],'
-          + '[data-widget*="Address"], [data-widget*="address"],'
-          + '[data-widget*="Location"], [data-widget*="location"]');
-        const result = [];
-        for (const el of nodes) {
-          const rect = el.getBoundingClientRect();
-          if (!rect.width || !rect.height) continue;
-          const txt = (el.innerText || '').trim();
-          if (txt && txt.length < 3000) result.push(txt);
-        }
-        for (const el of document.querySelectorAll('button,a')) {
-          const rect = el.getBoundingClientRect();
-          if (!rect.width || !rect.height || rect.top > 250 || rect.bottom < 0) continue;
-          const txt = (el.innerText || '').trim();
-          if (txt && txt.length < 180) result.push(txt);
-        }
-        return result.join(' | ').slice(0,15000);
-    """) or ""
+       return [...document.querySelectorAll('header,[data-widget*="Header"],'
+         + '[data-widget*="Address"],[data-widget*="address"],'
+         + '[data-widget*="Location"],[data-widget*="location"]')]
+         .filter(e => e.getBoundingClientRect().width)
+         .map(e => e.innerText).filter(Boolean).join(' | ').slice(0,12000);
+    """) or ''
 
 
-def check_visible_pvz(driver, expected_address: str, *, timeout: int = 8):
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.common.exceptions import TimeoutException
-    # Ozon may initially report an anti-bot title for an otherwise loading page.
-    # Wait for real header content, rather than rejecting the first title.
-    if "/geo/" in driver.current_url:
-        raise PickupPointError("Не удалось выйти со страницы ПВЗ")
-
-    def address_ready(d):
-        return address_matches(expected_address, visible_location_text(d))
-
-    try:
-        WebDriverWait(driver, timeout, poll_frequency=0.2).until(address_ready)
-    except TimeoutException as exc:
-        if is_blocked(driver):
-            raise BlockedError("Ozon продолжает показывать CAPTCHA/ограничение доступа") from exc
-        txt = visible_location_text(driver)[:230].replace("\n", " ")
-        raise PickupPointError(f"ПВЗ не подтверждён в шапке Ozon: {txt!r}") from exc
-
-
-def set_pvz(driver, pvz_url: str, explicit_address: str | None = None) -> str:
-    """Apply a PVZ in the existing tab. The next page verifies its address.
-
-    Ozon can replace the button's DOM node immediately after a click. Treat
-    stale-element references as an in-progress re-render, not a hard failure.
-    """
+def set_pvz(driver, url: str) -> str:
+    """Choose PVZ without opening tabs; storefront will verify actual selection."""
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
 
-    driver.get(pvz_url)
+    driver.get(url)
     xpath = ("//*[self::button or self::a or @role='button']"
              "[contains(normalize-space(.),'Сохранить адрес') and contains(normalize-space(.),'покупкам')]")
 
     def ready(d):
-        address = explicit_address or geo_page_address(d)
+        address = _address(d.title or '')
         if not address:
             return False
-        for el in d.find_elements(By.XPATH, xpath):
+        for element in d.find_elements(By.XPATH, xpath):
             try:
-                if el.is_displayed() and el.is_enabled():
-                    return (address, el)
+                if element.is_displayed() and element.is_enabled():
+                    return address, element
             except StaleElementReferenceException:
-                # Ozon rebuilt the button; poll for a fresh reference.
                 continue
         return False
 
     try:
-        expected, button = WebDriverWait(
-            driver, PVZ_READY_TIMEOUT, poll_frequency=0.15
-        ).until(ready)
+        address, button = WebDriverWait(driver, 6, poll_frequency=.15).until(ready)
     except TimeoutException as exc:
         if is_blocked(driver):
-            raise BlockedError("Ozon продолжает показывать CAPTCHA на странице ПВЗ") from exc
-        raise PickupPointError("Не удалось дождаться адреса или кнопки выбора ПВЗ") from exc
+            raise AccessError('Ozon требует CAPTCHA при выборе ПВЗ') from exc
+        raise CatalogError('Не удалось найти адрес и кнопку выбора ПВЗ') from exc
 
-    def click_applied(d):
-        # A navigation is a positive signal. If still on /geo/, check a fresh
-        # DOM snapshot instead of accessing the old button reference.
-        if "/geo/" not in d.current_url:
+    def applied(d):
+        if '/geo/' not in d.current_url:
             return True
         for el in d.find_elements(By.XPATH, xpath):
             try:
                 if el.is_displayed() and el.is_enabled():
                     return False
             except StaleElementReferenceException:
-                # The page is still changing. Try the next 150 ms poll.
                 return False
         return True
 
-    for attempt in range(2):
+    for _ in range(2):
         try:
             button.click()
-        except StaleElementReferenceException:
-            # The click may have triggered the re-render; do not count this
-            # as a CAPTCHA or assume that the selected address was saved.
-            if click_applied(driver):
-                break
-            if attempt:
-                raise PickupPointError("Кнопка выбора ПВЗ устарела после повторного поиска")
-            try:
-                expected, button = WebDriverWait(
-                    driver, 0.8, poll_frequency=0.15
-                ).until(ready)
-            except TimeoutException as exc:
-                raise PickupPointError("Не удалось повторно найти кнопку выбора ПВЗ") from exc
-            continue
-
-        try:
-            WebDriverWait(driver, 1.2, poll_frequency=0.15).until(click_applied)
-            break
-        except TimeoutException as exc:
+            WebDriverWait(driver, 1.2, poll_frequency=.15).until(applied)
+            return address
+        except (TimeoutException, StaleElementReferenceException):
             if is_blocked(driver):
-                raise BlockedError("Ozon продолжает показывать CAPTCHA при выборе ПВЗ") from exc
-            if attempt:
-                raise PickupPointError("Ozon не подтвердил нажатие кнопки выбора ПВЗ") from exc
+                raise AccessError('Ozon требует CAPTCHA при выборе ПВЗ')
             try:
-                expected, button = WebDriverWait(
-                    driver, 0.8, poll_frequency=0.15
-                ).until(ready)
-            except TimeoutException as find_exc:
-                raise PickupPointError("Не удалось повторно найти кнопку выбора ПВЗ") from find_exc
-
-    # No extra tab and no redundant homepage load. The caller verifies the
-    # actual selected address on the storefront before accepting prices.
-    return expected
+                address, button = WebDriverWait(driver, .8, poll_frequency=.15).until(ready)
+            except TimeoutException:
+                if applied(driver):
+                    return address
+                break
+    raise CatalogError('Не удалось подтвердить нажатие кнопки выбора ПВЗ')
 
 
-def price_as_int(text: str) -> int | None:
-    if not text:
-        return None
-    cleaned = text.replace("\u2009", " ").replace("\xa0", " ").replace("\u202f", " ")
-    match = re.fullmatch(r"\s*([0-9][0-9 ]*)\s*₽?\s*", cleaned)
-    return int(match.group(1).replace(" ", "")) if match else None
-
-
-def collect_candidates(driver) -> list[PriceCandidate]:
-    """Read visible prices only. We don't assume the first price is Ozon Card price."""
-    from selenium.webdriver.common.by import By
-    out: list[PriceCandidate] = []
-    keys: set[tuple[str, int]] = set()
-    for source, xpath in PRICE_XPATHS:
-        for el in driver.find_elements(By.XPATH, xpath):
-            if not el.is_displayed():
-                continue
-            value = price_as_int(el.text.strip())
-            if value is None or (source, value) in keys:
-                continue
-            keys.add((source, value))
-            try:
-                # Smaller ancestor text is more dependable than a whole price widget.
-                nearby = el.find_element(By.XPATH, "./..").text.strip()[:160]
-            except Exception:
-                nearby = ""
-            out.append(PriceCandidate(value, source, nearby))
-    return out[:20]
-
-
-def visible_body_excerpt(driver, limit: int = 2500) -> str:
-    """Sample visible page content without asking Selenium for every DOM element."""
-    try:
-        return (driver.execute_script(
-            "return (document.body && document.body.innerText || '').slice(0, arguments[0]);",
-            limit
-        ) or "")
-    except Exception:
-        return ""
-
-
-def is_blocked(driver) -> bool:
-    """Fast captcha/block detection even when body text is not rendered yet."""
-    try:
-        if any(term in (driver.title or "").casefold() for term in ("antibot", "captcha")):
-            return True
-        return any(phrase in visible_body_excerpt(driver).casefold() for phrase in BLOCK_PHRASES)
-    except Exception:
-        return False
-
-
-def product_redirected(driver, article: str) -> bool:
-    """Do not mistake prices in Ozon search/recommendations for the requested item."""
-    current = urlparse(driver.current_url)
-    path = current.path.rstrip("/")
-    if path.startswith("/search"):
-        return True
-    # Accept product id URLs, possibly canonical URLs of the form /product/name-12345.
-    if path == f"/product/{article}":
-        return False
-    if path.startswith("/product/") and re.search(rf"(?:^|[-/]){re.escape(article)}$", path):
-        return False
-    return True
-
-
-def read_article(driver, item: PriceItem, expected_address: str) -> PriceResult:
+def _wait_store(driver, address: str, timeout: float = 8):
+    """Wait for the storefront header and target catalog to render."""
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.common.exceptions import TimeoutException
-    result = PriceResult(index=item.index, article=item.article, pvz_url=item.pvz_url,
-                         pvz_address=expected_address, checked_at=utc_now())
-    url = f"https://www.ozon.ru/product/{item.article}/"
+
+    def ready(d):
+        if not _matches(address, _header_text(d)):
+            return False
+        return bool(d.execute_script("return document.querySelector('#contentScrollPaginator')"))
+
     try:
-        driver.get(url)
-        # A brief anti-bot interstitial can appear before the product page renders.
-        # Check real page content and the selected pickup point before deciding.
-        # Verify the PVZ on the actual product/search page, in the same tab.
-        # This also waits for any transient anti-bot interstitial to resolve.
-        check_visible_pvz(driver, expected_address, timeout=4)
-        if product_redirected(driver, item.article):
-            result.status = 'unavailable'
-            result.message = 'Ozon перенаправил с карточки товара; цена похожих предложений не учитывается'
-            return result
-        body = visible_body_excerpt(driver).casefold()
-        if any(phrase in body for phrase in UNAVAILABLE_PHRASES):
-            result.status = 'unavailable'
-            result.message = 'Товар недоступен для выбранного ПВЗ'
-            return result
+        WebDriverWait(driver, timeout, poll_frequency=.2).until(ready)
+    except TimeoutException as exc:
+        if is_blocked(driver):
+            raise AccessError('Ozon требует CAPTCHA при открытии магазина') from exc
+        raise CatalogError('Не подтверждён ПВЗ или отсутствует каталог магазина') from exc
 
-        def price_or_terminal(d):
-            if product_redirected(d, item.article):
-                return "unavailable"
-            page = visible_body_excerpt(d).casefold()
-            if any(phrase in page for phrase in UNAVAILABLE_PHRASES):
-                return "unavailable"
-            candidates = collect_candidates(d)
-            return candidates if candidates else False
 
+def _snapshot(driver) -> dict:
+    return driver.execute_script(EXTRACT)
+
+
+def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *, headed: bool = False,
+            load_timeout: float = 2.5, idle_limit: int = 4,
+            max_scrolls: int = 100, max_attempts: int = 2) -> Catalog:
+    """Read all visible/lazy-loaded catalog tiles in one Chrome, no database."""
+    store, pvz = store_url(store), pvz_url(pvz)
+    start = time.monotonic()
+    for attempt in range(max_attempts):
+        driver = None
         try:
-            state = WebDriverWait(driver, PRICE_WAIT, poll_frequency=0.2).until(price_or_terminal)
-        except TimeoutException:
-            # Classify persistent access restrictions only after waiting for the price.
-            if is_blocked(driver):
-                raise BlockedError("Ozon продолжает показывать CAPTCHA на карточке товара")
-            state = None
-        if state == "unavailable":
-            result.status = "unavailable"
-            result.message = "Товар недоступен либо карточка перенаправила на поиск"
-        elif state:
-            chosen = next((c for c in state if c.source == "webPrice"), state[0])
-            result.price = chosen.price
-            result.status = "ok"
-            result.source = chosen.source
-            result.checked_at = utc_now()
-        else:
-            result.status = "no_price"
-            result.message = f"Цена не появилась за {PRICE_WAIT:g} сек"
-        return result
-    except BlockedError as exc:
-        result.status = "blocked"
-        result.message = str(exc)
-    except PickupPointError as exc:
-        result.status = "pvz_unverified"
-        result.message = str(exc)
-    except TimeoutException:
-        result.status = "timeout"
-        result.message = "Не удалось загрузить карточку за отведённое время"
-    except Exception as exc:
-        result.status = "error"
-        result.message = f"{type(exc).__name__}: {str(exc)[:160]}"
-        LOG.warning("SKU %s: %s", item.article, result.message)
-    # No automatic rapid retries: blocked sessions are not usable, and repeated
-    # requests could aggravate anti-bot restrictions. Retry transient errors later.
-    return result
-
-
-def scan_pvz_group(pvz_url: str, items: list[PriceItem], headed: bool = False) -> list[PriceResult]:
-    """Up to 5 attempts for THIS half only. No result is reused across attempts."""
-    for attempt in range(1, MAX_BATCH_ATTEMPTS + 1):
-        LOG.info('Subset %s..%s attempt %d/%d', items[0].index, items[-1].index,
-                 attempt, MAX_BATCH_ATTEMPTS)
-        results = _scan_pvz_group_once(pvz_url, items, headed=headed)
-        failed = next((r for r in results if r.status in RETRYABLE_BATCH_STATUSES), None)
-        if failed is None:
-            return results
-        if attempt < MAX_BATCH_ATTEMPTS:
-            LOG.warning('Retry subset starting at SKU %s (%s), attempt %d/%d',
-                        items[0].article, failed.status, attempt + 1, MAX_BATCH_ATTEMPTS)
-            continue
-        return [PriceResult(index=item.index, article=item.article, pvz_url=item.pvz_url,
-                            checked_at=utc_now(), status=failed.status,
-                            message=f'Часть списка не обработана после {MAX_BATCH_ATTEMPTS} попыток: '
-                                    f'{(failed.message or failed.status)[:180]}')
-                for item in items]
-    raise AssertionError('Недостижимо')
-
-
-def _scan_pvz_group_once(pvz_url: str, items: list[PriceItem], headed: bool = False) -> list[PriceResult]:
-    """One attempt: one Chrome and one PVZ for every SKU in the package."""
-    driver = None
-    try:
-        driver = create_driver(headed=headed)
-        expected_values = {item.pvz_address for item in items if item.pvz_address}
-        if len(expected_values) > 1:
-            raise PickupPointError("Для одного ПВЗ заданы разные ожидаемые адреса")
-        expected = set_pvz(driver, pvz_url, next(iter(expected_values), None))
-        results: list[PriceResult] = []
-        for position, item in enumerate(items):
-            value = read_article(driver, item, expected)
-            results.append(value)
-            if value.status in ("blocked", "pvz_unverified"):
-                for remaining in items[position + 1:]:
-                    results.append(PriceResult(index=remaining.index, article=remaining.article,
-                        pvz_url=remaining.pvz_url, pvz_address=expected, checked_at=utc_now(),
-                        status="skipped_blocked", message="Сбор приостановлен после проверки доступа"))
-                break
-        return results
-    except Exception as exc:
-        LOG.warning("ПВЗ %s: %s", pvz_url, exc)
-        status = "blocked" if isinstance(exc, BlockedError) else "pvz_error"
-        return [PriceResult(index=item.index, article=item.article, pvz_url=item.pvz_url,
-                            pvz_address=item.pvz_address, checked_at=utc_now(),
-                            status=status, message=f"{type(exc).__name__}: {str(exc)[:230]}")
-                for item in items]
-    finally:
-        if driver is not None:
-            try:
+            driver = create_driver(headed)
+            address = set_pvz(driver, pvz)
+            driver.get(store)
+            _wait_store(driver, address)
+            collected: dict[str, dict] = {}
+            idle = 0
+            boundary_seen = False
+            last_signature = ()
+            complete = False
+            for step in range(max_scrolls):
+                snap = _snapshot(driver)
+                if not snap['ready']:
+                    raise CatalogError('Контейнер каталога исчез')
+                signature = tuple(row['article'] for row in snap['items'])
+                before = len(collected)
+                for row in snap['items']:
+                    prev = collected.get(row['article'])
+                    if prev is None or row['price'] is not None:
+                        collected[row['article']] = row
+                new = len(collected) - before
+                boundary_seen |= bool(snap['boundary'] or snap['end_visible'])
+                idle = 0 if new else idle + 1
+                LOG.info('Каталог %s: шаг %d, товаров %d (+%d), карточек %d, конец %s',
+                         store, step, len(collected), new, snap['visible'], boundary_seen)
+                if boundary_seen and idle >= idle_limit:
+                    complete = True
+                    break
+                if idle >= idle_limit and not boundary_seen:
+                    break
+                driver.execute_script(SCROLL)
+                # Poll for a different window of cards, not a larger DOM tile count:
+                # Ozon virtualizes the list and can keep only ~40 tiles in DOM.
+                deadline = time.monotonic() + load_timeout
+                while time.monotonic() < deadline:
+                    time.sleep(.2)
+                    fresh = _snapshot(driver)
+                    if fresh['ready'] and tuple(x['article'] for x in fresh['items']) != signature:
+                        break
+                last_signature = signature
+            if not collected:
+                raise CatalogError('В каталоге не найдены товары с артикулами')
+            return Catalog(store, pvz, address, sorted(collected.values(),key=lambda x:int(x['article'])),
+                           complete, round(time.monotonic()-start, 2))
+        except AccessError:
+            if attempt + 1 >= max_attempts:
+                raise
+            LOG.warning('CAPTCHA: повторный запуск браузера (%d/%d)',attempt+2,max_attempts)
+        finally:
+            if driver is not None:
                 driver.quit()
-            except Exception:
-                LOG.warning("Не удалось закрыть Chrome", exc_info=True)
-
-
-def scan_items(items: list[PriceItem], headed: bool = False, *, workers: int = 2) -> list[PriceResult]:
-    """Two independent concurrent Chromes, one PVZ and up to 100 SKUs overall.
-
-    Each Chrome handles a contiguous half of the input sequentially. A blocked
-    session restarts only its own half (up to 5 full attempts), never the other.
-    No persistent DB, cookies, cache or price files are created.
-    """
-    if not items:
-        return []
-    pvz_url = items[0].pvz_url
-    if any(item.pvz_url != pvz_url for item in items):
-        raise ValueError('В одном запросе разрешён только один ПВЗ')
-    if workers not in (1, 2):
-        raise ValueError('Число браузеров должно быть 1 или 2')
-    if workers == 1 or len(items) == 1:
-        return sorted(scan_pvz_group(pvz_url, items, headed), key=lambda result: result.index)
-    halfway = (len(items) + 1) // 2
-    subsets = (items[:halfway], items[halfway:])
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix='ozon-chrome') as pool:
-        tasks = [pool.submit(scan_pvz_group, pvz_url, subset, headed) for subset in subsets]
-        # Collect in submission order; both are already running concurrently.
-        results = [row for task in tasks for row in task.result()]
-    return sorted(results, key=lambda result: result.index)
-
-
-def diagnose_price(item: PriceItem, headed: bool = False) -> dict:
-    """Manual price audit; no screenshots or history are stored automatically."""
-    driver = None
-    try:
-        driver = create_driver(headed=headed)
-        expected = set_pvz(driver, item.pvz_url, item.pvz_address)
-        driver.get(f"https://www.ozon.ru/product/{item.article}/")
-        check_visible_pvz(driver, expected, timeout=6)
-        from selenium.webdriver.support.ui import WebDriverWait
-        WebDriverWait(driver, 12).until(lambda d: bool(collect_candidates(d)) or is_blocked(d))
-        candidates = [c.__dict__ for c in collect_candidates(driver)]
-        return {"article": item.article, "pvz_url": item.pvz_url, "pvz_address": expected,
-                "candidates": candidates, "blocked": is_blocked(driver),
-                "warning": "Только диагностические кандидаты; требуется сверка с ценой на витрине Ozon"}
-    finally:
-        if driver is not None:
-            driver.quit()
+    raise CatalogError('Сбор не завершён')
