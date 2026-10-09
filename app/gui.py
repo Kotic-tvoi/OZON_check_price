@@ -55,7 +55,7 @@ class PricesApp:
         self.busy = False
         self.store = tk.StringVar()
         self.pvz = tk.StringVar()
-        self.save_excel = tk.BooleanVar(value=False)
+        self.save_excel = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="Готово к проверке")
         root.title("OzonPrices — проверка конечных цен")
         root.geometry("780x610")
@@ -83,7 +83,7 @@ class PricesApp:
         self.add_input(panel, "Ссылка на магазин Ozon", self.store, DEFAULT_STORE)
         self.add_input(panel, "Ссылка на пункт выдачи (ПВЗ)", self.pvz, DEFAULT_PVZ)
 
-        ttk.Checkbutton(panel, text="Дополнительно сохранить Excel на компьютере",
+        ttk.Checkbutton(panel, text="Сохранить Excel на компьютере (рекомендуется)",
                         variable=self.save_excel).pack(anchor="w", pady=(7, 12))
 
         actions = ttk.Frame(panel, style="Main.TFrame")
@@ -154,20 +154,21 @@ class PricesApp:
                 http.close()
 
             self.events.put(("status", "Собираем цены в Chrome..."))
-            catalog = collect(store, pvz, headed=True)
+            catalog = collect(store, pvz)
             self.events.put(("log", f"Найдено: {len(catalog.items)}; "
                                       f"время: {catalog.elapsed_seconds} с."))
             if not catalog.complete:
                 self.events.put(("log", "Внимание: полнота каталога не подтверждена. "
                                           "Отсутствующие позиции не считаются удалёнными."))
 
+            if include_excel:
+                path = export_excel(catalog.items, catalog.complete)
+                self.events.put(("log", f"Excel сохранён: {path}"))
             self.events.put(("status", "Отправляем данные в Google Таблицу..."))
             result = upload_catalog(connection, catalog)
             self.events.put(("log", f"Google Таблица, лист «{result['sheet']}»: "
                                       f"записано {result['rows']} строк."))
-            if include_excel:
-                path = export_excel(catalog.items, catalog.complete)
-                self.events.put(("log", f"Excel сохранён: {path}"))
+
 
             self.events.put(("done", (
                 f"Готово. Проверено: {result['checked']}; в таблице: {result['rows']}. "
