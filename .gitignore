@@ -7,4 +7,10 @@ venv/
 *.log
 *.xlsx
 *.json
+*.zip
+*.spec
 exports/
+dist/
+build/
+config.local.json
+service-account.json
