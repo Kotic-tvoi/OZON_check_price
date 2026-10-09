@@ -6,7 +6,7 @@
 
 ## Сотруднику: первый запуск (Windows)
 
-1. Скачайте ZIP **именно ветки `feature/storefront-price-prototype`** из GitHub (Code → Download ZIP) и распакуйте всю папку.
+1. Скачайте ZIP ветки **`main`** из GitHub (Code → Download ZIP) и распакуйте всю папку.
 2. Установите [Python](https://www.python.org/downloads/windows/) версии 3.10+ и [Google Chrome](https://www.google.com/chrome/), если их ещё нет. При установке Python желательно включить `Add Python to PATH`. В VSCode работать не нужно.
 3. Дважды щёлкните **`START.bat`**. Он сам создаст `.venv` и установит Selenium. При первом запуске вставьте **ссылку веб-приложения Apps Script** (`.../exec`) и **ключ загрузки**, полученные от ответственного за таблицу.
 4. Программа откроет Chrome, соберёт цены, закроет браузер и запишет результаты в Google Таблицу. В следующий раз достаточно двойного клика на `START.bat`.
