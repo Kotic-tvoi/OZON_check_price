@@ -5,8 +5,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
-from config import DEFAULT_STORE, DEFAULT_PVZ
-from core import store_url, pvz_url
 
 DOCUMENT = "Проверка цен"
 TAB = "Проверка цен OZON"
@@ -71,22 +69,6 @@ def write_ranges(session, sid, ranges):
         json={"valueInputOption": "RAW", "data": [
             {"range": "'" + TAB + "'!" + area, "values": rows} for area, rows in ranges
         ]}), "запись цен")
-
-
-def parse_links(rows):
-    def cell(index):
-        return str(rows[index][0]).strip() if len(rows) > index and rows[index] else ""
-    return store_url(cell(0) or DEFAULT_STORE), pvz_url(cell(1) or DEFAULT_PVZ)
-
-
-def read_run_options(connection):
-    session = session_for(connection)
-    try:
-        sid = connection["sheet_id"]
-        check_target(session, sid)
-        return parse_links(read_range(session, sid, "H2:H3"))
-    finally:
-        session.close()
 
 
 def normalize(items):
@@ -156,107 +138,3 @@ def upload_catalog(connection, catalog):
         return result
     finally:
         session.close()
-
-
-class SheetAgent:
-    """A single employee PC polls one checkbox; no Apps Script or public port."""
-
-    def __init__(self, connection):
-        self.connection = connection
-        self.sid = connection["sheet_id"]
-        self.http = session_for(connection)
-        try:
-            response = response_json(self.http.get(
-                API + "/" + self.sid,
-                params={"fields": "properties(title),sheets(properties(sheetId,title))"},
-                timeout=30), "проверка листа")
-            if response.get("properties", {}).get("title") != DOCUMENT:
-                raise ValueError("Неверный документ: нужен «" + DOCUMENT + "»")
-            matches = [s.get("properties", {}) for s in response.get("sheets", [])
-                       if s.get("properties", {}).get("title") == TAB]
-            if not matches:
-                raise ValueError("В документе отсутствует лист «" + TAB + "»")
-            self.sheet_id = matches[0]["sheetId"]
-        except Exception:
-            self.http.close()
-            raise
-
-    def close(self):
-        self.http.close()
-
-    def prepare_interface(self):
-        """Create the checkbox and formatting, preserving H2/H3 and prices."""
-        sid = self.sheet_id
-        rectangle = lambda sr, er, sc, ec: {
-            "sheetId": sid, "startRowIndex": sr, "endRowIndex": er,
-            "startColumnIndex": sc, "endColumnIndex": ec}
-        body = {"requests": [
-            {"setDataValidation": {
-                "range": rectangle(1, 2, 4, 5),
-                "rule": {"condition": {"type": "BOOLEAN"},
-                         "strict": True, "showCustomUi": True}}},
-            {"repeatCell": {
-                "range": rectangle(0, 1, 3, 5),
-                "cell": {"userEnteredFormat": {
-                    "backgroundColor": {"red": 0.11, "green": 0.20, "blue": 0.34},
-                    "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1},
-                                   "bold": True}}},
-                "fields": "userEnteredFormat(backgroundColor,textFormat)"}},
-            {"repeatCell": {
-                "range": rectangle(1, 2, 4, 5),
-                "cell": {"userEnteredFormat": {
-                    "backgroundColor": {"red": 0.80, "green": 0.94, "blue": 0.86}}},
-                "fields": "userEnteredFormat.backgroundColor"}},
-            {"updateDimensionProperties": {
-                "range": {"sheetId": sid, "dimension": "COLUMNS",
-                          "startIndex": 0, "endIndex": 2},
-                "properties": {"pixelSize": 155}, "fields": "pixelSize"}},
-            {"updateDimensionProperties": {
-                "range": {"sheetId": sid, "dimension": "COLUMNS",
-                          "startIndex": 3, "endIndex": 4},
-                "properties": {"pixelSize": 170}, "fields": "pixelSize"}},
-            {"updateDimensionProperties": {
-                "range": {"sheetId": sid, "dimension": "COLUMNS",
-                          "startIndex": 4, "endIndex": 5},
-                "properties": {"pixelSize": 380}, "fields": "pixelSize"}},
-            {"updateDimensionProperties": {
-                "range": {"sheetId": sid, "dimension": "COLUMNS",
-                          "startIndex": 6, "endIndex": 7},
-                "properties": {"pixelSize": 185}, "fields": "pixelSize"}},
-            {"updateDimensionProperties": {
-                "range": {"sheetId": sid, "dimension": "COLUMNS",
-                          "startIndex": 7, "endIndex": 9},
-                "properties": {"pixelSize": 360}, "fields": "pixelSize"}},
-        ]}
-        response_json(self.http.post(
-            API + "/" + self.sid + ":batchUpdate", json=body, timeout=40),
-            "оформление листа")
-        initial = [
-            ("A1:B1", [["Артикул Ozon", "Конечная цена, ₽"]]),
-            ("D1:D2", [["ПРОВЕРКА ЦЕН OZON"], ["Запустить проверку →"]]),
-            ("D3:D10", [["Состояние"], ["Последняя проверка"], ["Найдено артикулов"],
-                         ["Полнота"], ["Сообщение"], ["Адрес ПВЗ"],
-                         ["Магазин URL"], ["ПВЗ URL"]]),
-            ("G1:G3", [["НАСТРОЙКИ"], ["Ссылка магазина"], ["Ссылка ПВЗ"]]),
-            ("I1:I3", [["Если поле пустое"], [DEFAULT_STORE], [DEFAULT_PVZ]]),
-        ]
-        write_ranges(self.http, self.sid, initial)
-        value = read_range(self.http, self.sid, "E2")
-        if not value:
-            write_ranges(self.http, self.sid, [("E2", [[False]])])
-        state = read_range(self.http, self.sid, "E3")
-        if not state or (state[0] and state[0][0] == "В работе"):
-            self.report("Ожидает запроса")
-
-    def requested(self):
-        value = read_range(self.http, self.sid, "E2")
-        return bool(value and value[0] and
-                    str(value[0][0]).strip().lower() in ("true", "истина", "1"))
-
-    def report(self, state, message=None, clear_request=False):
-        changes = [("E3", [[state]])]
-        if message is not None:
-            changes.append(("E7", [[str(message)[:1200]]]))
-        if clear_request:
-            changes.append(("E2", [[False]]))
-        write_ranges(self.http, self.sid, changes)
