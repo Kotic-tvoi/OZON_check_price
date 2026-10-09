@@ -40,5 +40,8 @@ def to_xlsx(rows: list[dict]) -> bytes:
     stream = BytesIO()
     with ZipFile(stream,'w',ZIP_DEFLATED) as archive:
         for name, content in files.items():
+            # Include XML declarations for strict Excel/OpenXML readers.
+            if not content.startswith('<?xml'):
+                content = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' + content
             archive.writestr(name, content)
     return stream.getvalue()
