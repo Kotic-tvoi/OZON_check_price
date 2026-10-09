@@ -68,7 +68,7 @@ def main() -> int:
             result = upload_catalog(connection, catalog)
             print(f'Готово! Google Таблица: лист «{result["sheet"]}», строк: {result["rows"]}.')
             if not catalog.complete:
-                print('Неполный сбор записан отдельно и НЕ заменяет лист полного каталога.')
+                print('Неполный сбор: список обновлён на том же листе; старые отсутствующие артикулы сохранены.')
         return 0
     except (AccessError, CatalogError, OSError, ValueError) as exc:
         print(f'\nОШИБКА: {exc}')
