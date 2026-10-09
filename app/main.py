@@ -1,50 +1,68 @@
-"""Local CLI for comparing another store and another PVZ before server deployment."""
+"""One-click Windows runner: Ozon catalog -> Google Sheet, or optional Excel."""
+from __future__ import annotations
+
 import argparse
-import json
 import logging
+from datetime import datetime
 from pathlib import Path
 
-from config import (DEFAULT_STORE, DEFAULT_PVZ, LOAD_TIMEOUT, IDLE_LIMIT,
-                    MAX_SCROLLS, CAPTCHA_MAX_ATTEMPTS)
-from scraper import collect
+from scraper import AccessError, CatalogError, collect
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Ozon: цены каталога магазина')
-    parser.add_argument('--store', default=DEFAULT_STORE, help='https://www.ozon.ru/seller/название/')
-    parser.add_argument('--pvz', default=DEFAULT_PVZ, help='https://www.ozon.ru/geo/город/id/')
-    parser.add_argument('--headed', action='store_true', help='Показать Chrome')
-    parser.add_argument('--json', type=Path, help='Дополнительно сохранить JSON-файл')
-    parser.add_argument('--xlsx', type=Path, help='Дополнительно сохранить Excel (два столбца)')
-    parser.add_argument('--load-timeout', type=float, default=LOAD_TIMEOUT)
-    parser.add_argument('--idle-limit', type=int, default=IDLE_LIMIT)
-    parser.add_argument('--max-scrolls', type=int, default=MAX_SCROLLS)
-    parser.add_argument('--max-attempts', type=int, default=CAPTCHA_MAX_ATTEMPTS,
-                        help='Всего попыток при CAPTCHA, включая первую')
+def export_excel(catalog) -> Path:
+    from xlsx_export import to_xlsx
+    directory = ROOT / 'exports'
+    directory.mkdir(parents=True, exist_ok=True)
+    suffix = '' if catalog.complete else '_НЕПОЛНЫЙ'
+    filename = 'ozon_' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S') + suffix + '.xlsx'
+    path = directory / filename
+    path.write_bytes(to_xlsx(catalog.items))
+    return path
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description='Сбор конечных цен Ozon')
+    parser.add_argument('--excel-only', action='store_true',
+                        help='Вместо Google Таблицы сохранить отдельный Excel')
     args = parser.parse_args()
-    if args.xlsx and args.xlsx.suffix.lower() != '.xlsx':
-        parser.error('Файл Excel должен иметь расширение .xlsx')
     logging.basicConfig(level=logging.INFO, format='%(message)s')
-    catalog = collect(args.store, args.pvz, headed=args.headed,
-                      load_timeout=args.load_timeout,
-                      idle_limit=args.idle_limit, max_scrolls=args.max_scrolls,
-                      max_attempts=args.max_attempts)
-    print('Артикул товара | Конечная цена')
-    for item in catalog.items:
-        print(f"{item['article']} | {item['price'] if item['price'] is not None else 'Нет данных'}")
-    print(f'Найдено: {len(catalog.items)}; время: {catalog.elapsed_seconds} с; '
-          f'конец каталога подтверждён: {catalog.complete}')
-    if args.json:
-        args.json.write_text(json.dumps(catalog.as_dict(), ensure_ascii=False, indent=2), encoding='utf-8')
-        print(f'JSON: {args.json}')
-    if args.xlsx:
-        from xlsx_export import to_xlsx
-        args.xlsx.write_bytes(to_xlsx(catalog.items))
-        print(f'Excel: {args.xlsx} ({len(catalog.items)} товаров)')
-    if not catalog.complete:
-        print('ВНИМАНИЕ: полнота каталога не подтверждена. '
-              'Excel содержит только найденные товары; отсутствующие артикулы нельзя считать недоступными.')
+
+    try:
+        if not args.excel_only:
+            from google_sheets import load_connection
+            connection = load_connection()
+
+        print('\nЗапускаем обычный Chrome. Не закрывайте окно до завершения сбора.\n', flush=True)
+        catalog = collect()
+        with_price = sum(item['price'] is not None for item in catalog.items)
+        print(f'\nНайдено артикулов: {len(catalog.items)}, с ценой: {with_price}.')
+        print(f'Время: {catalog.elapsed_seconds} с. ПВЗ: {catalog.pvz_address}.')
+        if not catalog.complete:
+            print('ВНИМАНИЕ: конец каталога не подтверждён. Результат может быть неполным.')
+
+        if args.excel_only:
+            path = export_excel(catalog)
+            print(f'Excel сохранён: {path}')
+        else:
+            from google_sheets import upload_catalog
+            result = upload_catalog(connection, catalog)
+            print(f'Готово! Google Таблица: лист «{result["sheet"]}», строк: {result["count"]}.')
+            if not catalog.complete:
+                print('Неполный сбор записан отдельно и НЕ заменяет лист полного каталога.')
+        return 0
+    except (AccessError, CatalogError, OSError, ValueError) as exc:
+        print(f'\nОШИБКА: {exc}')
+        return 1
+    except (KeyboardInterrupt, EOFError):
+        print('\nОперация отменена.')
+        return 1
+    except Exception:
+        # Unexpected exception: show traceback for support, without printing credentials.
+        logging.exception('Неожиданная ошибка')
+        return 1
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

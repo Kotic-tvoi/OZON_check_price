@@ -79,18 +79,14 @@ class Catalog:
         }
 
 
-def create_driver(headed: bool = False):
+def create_driver():
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     options = Options()
-    if not headed:
-        options.add_argument('--headless=new')
     options.add_argument(f'--window-size={CHROME_WINDOW_SIZE}')
     options.add_argument('--disable-blink-features=AutomationControlled')
     options.add_argument('--no-proxy-server')
     options.add_argument('--disable-extensions')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
     options.add_experimental_option('prefs', {
         'profile.managed_default_content_settings.images': 2,
     })
@@ -103,17 +99,20 @@ def create_driver(headed: bool = False):
 
 
 def is_blocked(driver) -> bool:
+    """Recognize Ozon anti-bot pages, including errors where JS is unavailable."""
+    markers = ('captcha', 'antibot', 'похоже, нет соединения',
+               'сопоставьте пазл', 'двигая ползунок',
+               'подтвердите, что вы не робот', 'fab_chlg_')
     try:
-        title = (driver.title or '').lower()
-        if 'captcha' in title or 'antibot' in title:
+        title = (driver.title or '').casefold()
+        if any(marker in title for marker in markers):
             return True
-        text = driver.execute_script(
-            "return (document.body?.innerText||'').slice(0,1500).toLowerCase()") or ''
-        return any(word in text for word in ('сопоставьте пазл', 'двигая ползунок',
-                                             'подтвердите, что вы не робот',
-                                             'похоже, нет соединения'))
+        text = (driver.execute_script(
+            "return (document.body?.innerText||'').slice(0,1500)") or '').casefold()
+        return any(marker in text for marker in markers)
     except Exception:
-        return False
+        # Chrome's error pages may block execute_script. Preserve title detection.
+        return any(marker in title for marker in markers) if 'title' in locals() else False
 
 
 def _address(title: str) -> str | None:
@@ -170,7 +169,7 @@ def set_pvz(driver, url: str) -> str:
         address, button = WebDriverWait(driver, PVZ_READY_TIMEOUT, poll_frequency=PVZ_POLL_INTERVAL).until(ready)
     except TimeoutException as exc:
         if is_blocked(driver):
-            raise AccessError('Ozon требует CAPTCHA при выборе ПВЗ') from exc
+            raise AccessError('Ozon показывает страницу ограничения при выборе ПВЗ') from exc
         raise CatalogError('Не удалось найти адрес и кнопку выбора ПВЗ') from exc
 
     def applied(d):
@@ -215,7 +214,7 @@ def _wait_store(driver, address: str, timeout: float = STORE_READY_TIMEOUT):
         WebDriverWait(driver, timeout, poll_frequency=STORE_POLL_INTERVAL).until(ready)
     except TimeoutException as exc:
         if is_blocked(driver):
-            raise AccessError('Ozon требует CAPTCHA при открытии магазина') from exc
+            raise AccessError('Ozon показывает страницу ограничения при открытии магазина') from exc
         raise CatalogError('Не подтверждён ПВЗ или отсутствует каталог магазина') from exc
 
 
@@ -223,7 +222,7 @@ def _snapshot(driver) -> dict:
     return driver.execute_script(EXTRACT)
 
 
-def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *, headed: bool = False,
+def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *,
             load_timeout: float = LOAD_TIMEOUT, idle_limit: int = IDLE_LIMIT,
             max_scrolls: int = MAX_SCROLLS, max_attempts: int = CAPTCHA_MAX_ATTEMPTS) -> Catalog:
     """Read all visible/lazy-loaded catalog tiles in one Chrome, no database."""
@@ -234,7 +233,7 @@ def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *, headed: bool 
     for attempt in range(max_attempts):
         driver = None
         try:
-            driver = create_driver(headed)
+            driver = create_driver()
             address = set_pvz(driver, pvz)
             driver.get(store)
             _wait_store(driver, address)
@@ -278,7 +277,7 @@ def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *, headed: bool 
         except AccessError:
             if attempt + 1 >= max_attempts:
                 raise
-            LOG.warning('CAPTCHA: повторный запуск браузера (%d/%d)',attempt+2,max_attempts)
+            LOG.warning('Проверка доступа Ozon: повторный запуск Chrome (%d/%d)',attempt+2,max_attempts)
         finally:
             if driver is not None:
                 driver.quit()
