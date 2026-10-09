@@ -30,7 +30,10 @@ python app/main.py --headed
 python app/main.py --headed --store "https://www.ozon.ru/seller/another-seller/" --pvz "https://www.ozon.ru/geo/moskva/442329/"
 ```
 
-Дополнительный JSON в файл: `--json prices.json`. Настройки можно переопределять при запуске, например:
+Дополнительный JSON: `--json prices.json`. Excel в двух колонках: `--xlsx ozon_prices.xlsx`.
+Артикулы в Excel записываются текстом, цены — числами, при отсутствии цены выводится «Нет данных».
+Excel создаётся только при указании `--xlsx`, без запуска HTTP-сервера. Если полнота каталога не подтверждена, файл содержит только найденные товары и выводится предупреждение.
+Настройки можно переопределять при запуске, например:
 
 ```bash
 python app/main.py --headed --load-timeout 3 --max-attempts 5
