@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from datetime import datetime
 from pathlib import Path
 
 from scraper import AccessError, CatalogError, collect
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent.parent
 
 
 def export_excel(catalog) -> Path:
@@ -26,16 +27,26 @@ def main() -> int:
     parser = argparse.ArgumentParser(description='Сбор конечных цен Ozon')
     parser.add_argument('--excel-only', action='store_true',
                         help='Вместо Google Таблицы сохранить отдельный Excel')
+    parser.add_argument('--check-build', action='store_true', help='Проверка EXE без браузера')
     args = parser.parse_args()
+    if args.check_build:
+        import selenium
+        import google.auth
+        print('OK: зависимости EXE загружены')
+        return 0
     logging.basicConfig(level=logging.INFO, format='%(message)s')
+    if args.excel_only:
+        from config import DEFAULT_STORE, DEFAULT_PVZ
+        store, pvz = DEFAULT_STORE, DEFAULT_PVZ
 
     try:
         if not args.excel_only:
-            from google_sheets import load_connection
+            from google_sheets import load_connection, read_run_options
             connection = load_connection()
+            store, pvz = read_run_options(connection)
 
         print('\nЗапускаем обычный Chrome. Не закрывайте окно до завершения сбора.\n', flush=True)
-        catalog = collect()
+        catalog = collect(store, pvz, headed=True)
         with_price = sum(item['price'] is not None for item in catalog.items)
         print(f'\nНайдено артикулов: {len(catalog.items)}, с ценой: {with_price}.')
         print(f'Время: {catalog.elapsed_seconds} с. ПВЗ: {catalog.pvz_address}.')
@@ -48,7 +59,7 @@ def main() -> int:
         else:
             from google_sheets import upload_catalog
             result = upload_catalog(connection, catalog)
-            print(f'Готово! Google Таблица: лист «{result["sheet"]}», строк: {result["count"]}.')
+            print(f'Готово! Google Таблица: лист «{result["sheet"]}», строк: {result["rows"]}.')
             if not catalog.complete:
                 print('Неполный сбор записан отдельно и НЕ заменяет лист полного каталога.')
         return 0
@@ -65,4 +76,10 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    status = main()
+    if getattr(sys, 'frozen', False) and '--check-build' not in sys.argv:
+        try:
+            input('\nНажмите Enter, чтобы закрыть окно...')
+        except (EOFError, KeyboardInterrupt):
+            pass
+    raise SystemExit(status)
