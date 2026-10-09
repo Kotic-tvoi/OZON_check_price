@@ -4,10 +4,6 @@ from __future__ import annotations
 import re
 from urllib.parse import urlparse
 
-from config import MAX_ARTICLES
-SKU_PATTERN = re.compile(r'\d{1,24}\Z')
-
-
 class InputError(ValueError):
     pass
 
@@ -35,16 +31,3 @@ def pvz_url(value: str) -> str:
     if not re.fullmatch(r'/geo/[a-z0-9-]+/\d+/?', path, re.I):
         raise InputError('Ссылка ПВЗ должна быть вида https://www.ozon.ru/geo/moskva/442329/')
     return 'https://www.ozon.ru' + path.rstrip('/') + '/'
-
-
-def articles(value) -> list[str] | None:
-    if value is None:
-        return None
-    if not isinstance(value, list) or not 1 <= len(value) <= MAX_ARTICLES:
-        raise InputError('articles: массив из 1–100 артикулов либо поле не передано')
-    result = []
-    for article in value:
-        if isinstance(article, bool) or not SKU_PATTERN.fullmatch(str(article).strip()):
-            raise InputError(f'Некорректный артикул: {str(article)[:70]}')
-        result.append(str(article).strip())
-    return result

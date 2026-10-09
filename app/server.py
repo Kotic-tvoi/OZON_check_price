@@ -10,7 +10,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from config import DEFAULT_PVZ, DEFAULT_STORE, MAX_REQUEST_BYTES
-from core import InputError, articles, pvz_url, store_url
+from core import InputError, pvz_url, store_url
 from scraper import AccessError, CatalogError, collect
 
 LOG = logging.getLogger('ozon.api')
@@ -25,11 +25,13 @@ class Handler(BaseHTTPRequestHandler):
         content = json.dumps(data, ensure_ascii=False).encode('utf-8')
         self.send_bytes(status, content, 'application/json; charset=utf-8')
 
-    def send_bytes(self, status, content, mime):
+    def send_bytes(self, status, content, mime, filename=None):
         self.send_response(status)
         self.send_header('Content-Type', mime)
         self.send_header('Content-Length', str(len(content)))
         self.send_header('Cache-Control', 'no-store')
+        if filename:
+            self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
         self.end_headers()
         self.wfile.write(content)
 
@@ -40,7 +42,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(404, {'error': 'not_found'})
 
     def do_POST(self):
-        if self.path not in ('/v1/catalog', '/v1/prices', '/v1/prices.xlsx'):
+        if self.path not in ('/v1/catalog', '/v1/catalog.xlsx'):
             return self.send_json(404, {'error': 'not_found'})
         token = os.getenv('OZON_API_TOKEN', '')
         if not token or not hmac.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + token):
@@ -54,30 +56,23 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length))
             if not isinstance(body, dict):
                 raise InputError('Ожидается JSON-объект')
+            # Ручной список артикулов больше не поддерживается: собираем весь магазин.
+            if set(body) - {'store_url', 'pvz_url'}:
+                raise InputError('Допустимы только store_url и pvz_url; список articles не нужен')
             store = store_url(body.get('store_url', DEFAULT_STORE))
             pvz = pvz_url(body.get('pvz_url', DEFAULT_PVZ))
-            requested = articles(body.get('articles'))
-            if self.path != '/v1/catalog' and requested is None:
-                raise InputError('Передайте articles: список артикулов для проверки')
             catalog = collect(store, pvz)
             if not catalog.complete:
                 return self.send_json(503, {'error': 'catalog_incomplete',
-                    'message': 'Не удалось подтвердить загрузку всего каталога; цены в таблице не обновлены',
+                    'message': 'Не удалось подтвердить загрузку всего каталога',
                     'found': len(catalog.items)})
-            if self.path == '/v1/catalog':
-                return self.send_json(200, catalog.as_dict())
-            available = {x['article']: x['price'] for x in catalog.items}
-            rows = [{'index':i,'article':sku,'price':available.get(sku),
-                     'status':('ok' if available.get(sku) is not None else
-                               'no_price' if sku in available else 'not_in_catalog')}
-                    for i,sku in enumerate(requested)]
-            if self.path.endswith('.xlsx'):
+            if self.path == '/v1/catalog.xlsx':
                 from xlsx_export import to_xlsx
-                return self.send_bytes(200, to_xlsx(rows),
-                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-            self.send_json(200, {'pvz_url':pvz,'store_url':store,
-                'summary':{'total':len(rows),'found':sum(x['price'] is not None for x in rows)},
-                'results':rows})
+                # Excel создаётся только в оперативной памяти и сразу отдаётся клиенту.
+                return self.send_bytes(200, to_xlsx(catalog.items),
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    filename='ozon_catalog.xlsx')
+            return self.send_json(200, catalog.as_dict())
         except (InputError, ValueError, json.JSONDecodeError) as exc:
             self.send_json(400, {'error':'invalid_request','message':str(exc)})
         except (AccessError, CatalogError) as exc:
