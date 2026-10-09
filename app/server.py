@@ -9,7 +9,8 @@ import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from core import DEFAULT_PVZ, DEFAULT_STORE, InputError, articles, pvz_url, store_url
+from config import DEFAULT_PVZ, DEFAULT_STORE, MAX_REQUEST_BYTES
+from core import InputError, articles, pvz_url, store_url
 from scraper import AccessError, CatalogError, collect
 
 LOG = logging.getLogger('ozon.api')
@@ -48,7 +49,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(409, {'error': 'busy'})
         try:
             length = int(self.headers.get('Content-Length', '0'))
-            if not 1 <= length <= 120_000:
+            if not 1 <= length <= MAX_REQUEST_BYTES:
                 raise InputError('Неверный размер запроса')
             body = json.loads(self.rfile.read(length))
             if not isinstance(body, dict):

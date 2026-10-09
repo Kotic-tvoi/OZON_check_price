@@ -4,9 +4,7 @@ from __future__ import annotations
 import re
 from urllib.parse import urlparse
 
-DEFAULT_STORE = 'https://www.ozon.ru/seller/jkeratin/'
-DEFAULT_PVZ = 'https://www.ozon.ru/geo/moskva/442329/'
-MAX_ARTICLES = 100
+from config import MAX_ARTICLES
 SKU_PATTERN = re.compile(r'\d{1,24}\Z')
 
 

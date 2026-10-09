@@ -7,7 +7,12 @@ import re
 import time
 from dataclasses import dataclass
 
-from core import DEFAULT_PVZ, DEFAULT_STORE, pvz_url, store_url
+from config import (DEFAULT_PVZ, DEFAULT_STORE, LOAD_TIMEOUT, IDLE_LIMIT,
+                    MAX_SCROLLS, CAPTCHA_MAX_ATTEMPTS, SCROLL_POLL_INTERVAL,
+                    CHROME_WINDOW_SIZE, PAGE_LOAD_TIMEOUT, PVZ_READY_TIMEOUT,
+                    PVZ_POLL_INTERVAL, PVZ_CLICK_TIMEOUT, PVZ_RETRY_TIMEOUT,
+                    STORE_READY_TIMEOUT, STORE_POLL_INTERVAL)
+from core import pvz_url, store_url
 
 LOG = logging.getLogger('ozon.storefront')
 
@@ -80,7 +85,7 @@ def create_driver(headed: bool = False):
     options = Options()
     if not headed:
         options.add_argument('--headless=new')
-    options.add_argument('--window-size=1920,1080')
+    options.add_argument(f'--window-size={CHROME_WINDOW_SIZE}')
     options.add_argument('--disable-blink-features=AutomationControlled')
     options.add_argument('--no-proxy-server')
     options.add_argument('--disable-extensions')
@@ -93,7 +98,7 @@ def create_driver(headed: bool = False):
     if os.getenv('OZON_CHROME_BINARY'):
         options.binary_location = os.environ['OZON_CHROME_BINARY']
     driver = webdriver.Chrome(options=options)
-    driver.set_page_load_timeout(30)
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
     return driver
 
 
@@ -162,7 +167,7 @@ def set_pvz(driver, url: str) -> str:
         return False
 
     try:
-        address, button = WebDriverWait(driver, 6, poll_frequency=.15).until(ready)
+        address, button = WebDriverWait(driver, PVZ_READY_TIMEOUT, poll_frequency=PVZ_POLL_INTERVAL).until(ready)
     except TimeoutException as exc:
         if is_blocked(driver):
             raise AccessError('Ozon требует CAPTCHA при выборе ПВЗ') from exc
@@ -182,13 +187,13 @@ def set_pvz(driver, url: str) -> str:
     for _ in range(2):
         try:
             button.click()
-            WebDriverWait(driver, 1.2, poll_frequency=.15).until(applied)
+            WebDriverWait(driver, PVZ_CLICK_TIMEOUT, poll_frequency=PVZ_POLL_INTERVAL).until(applied)
             return address
         except (TimeoutException, StaleElementReferenceException):
             if is_blocked(driver):
                 raise AccessError('Ozon требует CAPTCHA при выборе ПВЗ')
             try:
-                address, button = WebDriverWait(driver, .8, poll_frequency=.15).until(ready)
+                address, button = WebDriverWait(driver, PVZ_RETRY_TIMEOUT, poll_frequency=PVZ_POLL_INTERVAL).until(ready)
             except TimeoutException:
                 if applied(driver):
                     return address
@@ -196,7 +201,7 @@ def set_pvz(driver, url: str) -> str:
     raise CatalogError('Не удалось подтвердить нажатие кнопки выбора ПВЗ')
 
 
-def _wait_store(driver, address: str, timeout: float = 8):
+def _wait_store(driver, address: str, timeout: float = STORE_READY_TIMEOUT):
     """Wait for the storefront header and target catalog to render."""
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.common.exceptions import TimeoutException
@@ -207,7 +212,7 @@ def _wait_store(driver, address: str, timeout: float = 8):
         return bool(d.execute_script("return document.querySelector('#contentScrollPaginator')"))
 
     try:
-        WebDriverWait(driver, timeout, poll_frequency=.2).until(ready)
+        WebDriverWait(driver, timeout, poll_frequency=STORE_POLL_INTERVAL).until(ready)
     except TimeoutException as exc:
         if is_blocked(driver):
             raise AccessError('Ozon требует CAPTCHA при открытии магазина') from exc
@@ -219,10 +224,12 @@ def _snapshot(driver) -> dict:
 
 
 def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *, headed: bool = False,
-            load_timeout: float = 2.5, idle_limit: int = 4,
-            max_scrolls: int = 100, max_attempts: int = 2) -> Catalog:
+            load_timeout: float = LOAD_TIMEOUT, idle_limit: int = IDLE_LIMIT,
+            max_scrolls: int = MAX_SCROLLS, max_attempts: int = CAPTCHA_MAX_ATTEMPTS) -> Catalog:
     """Read all visible/lazy-loaded catalog tiles in one Chrome, no database."""
     store, pvz = store_url(store), pvz_url(pvz)
+    if load_timeout <= 0 or idle_limit < 1 or max_scrolls < 1 or max_attempts < 1:
+        raise ValueError('Параметры ожидания, прокрутки и попыток должны быть положительными')
     start = time.monotonic()
     for attempt in range(max_attempts):
         driver = None
@@ -234,7 +241,6 @@ def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *, headed: bool 
             collected: dict[str, dict] = {}
             idle = 0
             boundary_seen = False
-            last_signature = ()
             complete = False
             for step in range(max_scrolls):
                 snap = _snapshot(driver)
@@ -261,11 +267,10 @@ def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *, headed: bool 
                 # Ozon virtualizes the list and can keep only ~40 tiles in DOM.
                 deadline = time.monotonic() + load_timeout
                 while time.monotonic() < deadline:
-                    time.sleep(.2)
+                    time.sleep(SCROLL_POLL_INTERVAL)
                     fresh = _snapshot(driver)
                     if fresh['ready'] and tuple(x['article'] for x in fresh['items']) != signature:
                         break
-                last_signature = signature
             if not collected:
                 raise CatalogError('В каталоге не найдены товары с артикулами')
             return Catalog(store, pvz, address, sorted(collected.values(),key=lambda x:int(x['article'])),
