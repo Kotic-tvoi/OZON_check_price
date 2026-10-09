@@ -103,17 +103,20 @@ def create_driver(headed: bool = False):
 
 
 def is_blocked(driver) -> bool:
+    """Recognize Ozon anti-bot pages, including errors where JS is unavailable."""
+    markers = ('captcha', 'antibot', 'похоже, нет соединения',
+               'сопоставьте пазл', 'двигая ползунок',
+               'подтвердите, что вы не робот', 'fab_chlg_')
     try:
-        title = (driver.title or '').lower()
-        if 'captcha' in title or 'antibot' in title:
+        title = (driver.title or '').casefold()
+        if any(marker in title for marker in markers):
             return True
-        text = driver.execute_script(
-            "return (document.body?.innerText||'').slice(0,1500).toLowerCase()") or ''
-        return any(word in text for word in ('сопоставьте пазл', 'двигая ползунок',
-                                             'подтвердите, что вы не робот',
-                                             'похоже, нет соединения'))
+        text = (driver.execute_script(
+            "return (document.body?.innerText||'').slice(0,1500)") or '').casefold()
+        return any(marker in text for marker in markers)
     except Exception:
-        return False
+        # Chrome's error pages may block execute_script. Preserve title detection.
+        return any(marker in title for marker in markers) if 'title' in locals() else False
 
 
 def _address(title: str) -> str | None:
