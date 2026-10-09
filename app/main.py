@@ -9,6 +9,13 @@ from pathlib import Path
 
 from scraper import AccessError, CatalogError, collect
 
+# GitHub Actions and older Windows consoles may default to cp1252.
+# Configure output before writing Russian messages.
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 ROOT = Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent.parent
 
 
