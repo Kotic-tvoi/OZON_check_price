@@ -1,9 +1,10 @@
 __pycache__/
 *.pyc
-venv/
 .venv/
+venv/
 .vscode/
 .env
 *.log
 *.xlsx
 *.json
+exports/
