@@ -1,1 +1,2 @@
 selenium==4.38.0
+google-auth[requests]>=2.35,<3
