@@ -1,99 +1,152 @@
-"""Upload the locally collected catalog to a Google Apps Script web app.
-
-The secret stays in config.local.json, never in the GitHub repository.
-No Google Cloud project, background service, or public PC port required.
-"""
-from __future__ import annotations
-
-import getpass
+"""Direct Google Sheets API access. No Apps Script or public endpoint."""
 import json
 import re
+import sys
+from datetime import datetime
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.parse import quote
+from config import DEFAULT_STORE, DEFAULT_PVZ
+from core import store_url, pvz_url
 
-CONNECTION_FILE = Path(__file__).resolve().parent.parent / 'config.local.json'
-SCRIPT_PATH = re.compile(r'^/macros/s/[^/]+/exec/?$')
-
-
-def _validate_url(url: str) -> str:
-    p = urlsplit(url.strip())
-    if (p.scheme != 'https' or p.hostname != 'script.google.com'
-            or p.username or p.password or p.port or p.query or p.fragment
-            or not SCRIPT_PATH.fullmatch(p.path)):
-        raise ValueError('Нужна ссылка Apps Script вида https://script.google.com/macros/s/.../exec')
-    return url.strip()
+DOCUMENT = "Проверка цен"
+TAB = "Проверка цен OZON"
+ACCOUNT = "sheets-server@fresh-forest-436813-i5.iam.gserviceaccount.com"
+API = "https://sheets.googleapis.com/v4/spreadsheets"
+SKU = re.compile(r"\d{7,12}\Z")
 
 
-def _validate_connection(data: dict) -> dict:
-    if not isinstance(data, dict):
-        raise ValueError('Некорректный config.local.json')
-    url = _validate_url(data.get('web_app_url', ''))
-    token = data.get('upload_token', '')
-    if not isinstance(token, str) or len(token.strip()) < 32:
-        raise ValueError('Ключ загрузки должен содержать не менее 32 символов')
-    return {'web_app_url': url, 'upload_token': token.strip()}
+def folder():
+    return Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
 
 
-def load_connection() -> dict:
-    if CONNECTION_FILE.exists():
-        try:
-            return _validate_connection(json.loads(CONNECTION_FILE.read_text(encoding='utf-8')))
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise ValueError(
-                'Ошибка в config.local.json: ' + str(exc)
-                + '. Исправьте его или удалите файл для повторной настройки.'
-            ) from exc
-
-    print('\nПЕРВАЯ НАСТРОЙКА GOOGLE ТАБЛИЦЫ')
-    print('Попросите ответственного за таблицу дать ссылку веб-приложения и ключ загрузки.')
-    url = input('Вставьте ссылку Apps Script (.../exec): ').strip()
-    token = getpass.getpass('Вставьте секретный ключ загрузки (не отображается): ').strip()
-    connection = _validate_connection({'web_app_url': url, 'upload_token': token})
-    CONNECTION_FILE.write_text(
-        json.dumps(connection, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
-    )
-    print('Настройки сохранены только на этом компьютере.\n')
-    return connection
+def load_connection():
+    config_file, secret = folder() / "config.local.json", folder() / "service-account.json"
+    if not config_file.is_file() or not secret.is_file():
+        raise ValueError("Нет настроек Google: распакуйте полный закрытый комплект от администратора.")
+    config = json.loads(config_file.read_text(encoding="utf-8-sig"))
+    key = json.loads(secret.read_text(encoding="utf-8-sig"))
+    sheet_id = config.get("spreadsheet_id", "")
+    if not isinstance(sheet_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{20,}", sheet_id):
+        raise ValueError("Неверный spreadsheet_id.")
+    if key.get("type") != "service_account" or key.get("client_email") != ACCOUNT:
+        raise ValueError("Неверный ключ сервисного аккаунта.")
+    return {"sheet_id": sheet_id, "key": secret}
 
 
-def upload_catalog(connection: dict, catalog) -> dict:
-    config = _validate_connection(connection)
-    payload = json.dumps({
-        'token': config['upload_token'],
-        'complete': bool(catalog.complete),
-        'store_url': catalog.store_url,
-        'pvz_url': catalog.pvz_url,
-        'pvz_address': catalog.pvz_address,
-        'items': catalog.items,
-    }, ensure_ascii=False).encode('utf-8')
+def session_for(connection):
+    from google.auth.transport.requests import AuthorizedSession
+    from google.oauth2 import service_account
+    creds = service_account.Credentials.from_service_account_file(
+        str(connection["key"]), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    return AuthorizedSession(creds)
 
-    request = Request(
-        config['web_app_url'],
-        data=payload,
-        headers={'Content-Type': 'application/json; charset=utf-8'},
-        method='POST',
-    )
+
+def response_json(response, action):
     try:
-        with urlopen(request, timeout=60) as response:
-            raw = response.read(1024 * 1024).decode('utf-8', errors='replace')
-    except HTTPError as exc:
-        raise ValueError(f'Google вернул HTTP {exc.code}. Проверьте доступ к веб-приложению.') from exc
-    except URLError as exc:
-        raise ValueError('Нет соединения с Google Apps Script: ' + str(exc.reason)) from exc
+        data = response.json()
+    except ValueError as exc:
+        raise ValueError("Неожиданный ответ Google: " + action) from exc
+    if not response.ok:
+        message = data.get("error", {}).get("message", str(response.status_code)) if isinstance(data, dict) else response.status_code
+        raise ValueError(f"Ошибка Google ({action}): {message}")
+    return data
 
+
+def check_target(session, sid):
+    meta = response_json(session.get(API + "/" + sid, params={
+        "fields": "properties(title),sheets(properties(title))"}, timeout=30), "проверка документа")
+    if meta["properties"]["title"] != DOCUMENT:
+        raise ValueError("Подключена не та Google Таблица. Ожидается «Проверка цен».")
+    if TAB not in [s.get("properties", {}).get("title") for s in meta.get("sheets", [])]:
+        raise ValueError("Нет листа «Проверка цен OZON».")
+
+
+def read_range(session, sid, cell_range):
+    url = API + "/" + sid + "/values/" + quote("'" + TAB + "'!" + cell_range, safe="!")
+    return response_json(session.get(url, timeout=30), "чтение таблицы").get("values", [])
+
+
+def write_ranges(session, sid, ranges):
+    response_json(session.post(API + "/" + sid + "/values:batchUpdate", timeout=60,
+        json={"valueInputOption": "RAW", "data": [
+            {"range": "'" + TAB + "'!" + area, "values": rows} for area, rows in ranges
+        ]}), "запись цен")
+
+
+def parse_links(rows):
+    def cell(index):
+        return str(rows[index][0]).strip() if len(rows) > index and rows[index] else ""
+    return store_url(cell(0) or DEFAULT_STORE), pvz_url(cell(1) or DEFAULT_PVZ)
+
+
+def read_run_options(connection):
+    session = session_for(connection)
     try:
-        result = json.loads(raw)
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise ValueError(
-            'Google вернул не JSON. Проверьте публикацию веб-приложения '
-            '(выполнение от вашего аккаунта, доступ «Все»), '
-            'ссылку /exec и разрешения скрипта.'
-        ) from exc
-    if not isinstance(result, dict) or result.get('ok') is not True:
-        detail = result.get('error', 'неизвестная ошибка') if isinstance(result, dict) else 'неизвестный ответ'
-        raise ValueError('Google Таблица не приняла данные: ' + str(detail))
-    if not isinstance(result.get('sheet'), str) or not isinstance(result.get('count'), int):
-        raise ValueError('Некорректное подтверждение записи от Google')
-    return result
+        sid = connection["sheet_id"]
+        check_target(session, sid)
+        return parse_links(read_range(session, sid, "H2:H3"))
+    finally:
+        session.close()
+
+
+def normalize(items):
+    output = {}
+    for row in items:
+        article = row.get("article")
+        price = row.get("price")
+        if not isinstance(article, str) or not SKU.fullmatch(article):
+            raise ValueError("Неверный артикул.")
+        if price is not None and (type(price) is not int or price < 0):
+            raise ValueError("Некорректная цена товара " + article)
+        output[article] = price
+    if not output:
+        raise ValueError("Нет товаров для выгрузки.")
+    return output
+
+
+def merge(old, items, complete, same_source):
+    found = normalize(items)
+    if not complete and old and not same_source:
+        raise ValueError("Каталог неполный и магазин/ПВЗ изменён. Старые цены не перезаписаны.")
+    output = {}
+    if not complete:
+        for row in old:
+            if row and SKU.fullmatch(str(row[0])):
+                output[str(row[0])] = row[1] if len(row) > 1 else "Нет данных"
+    for article, price in found.items():
+        if price is not None or article not in output:
+            output[article] = price if price is not None else "Нет данных"
+    return [[key, output[key]] for key in sorted(output, key=int)]
+
+
+def prepare_rows(old, previous, catalog):
+    previous_pvz = previous[0][0] if len(previous) >= 1 and previous[0] else ""
+    previous_store = previous[1][0] if len(previous) >= 2 and previous[1] else ""
+    same = previous_pvz == catalog.pvz_url and previous_store == catalog.store_url
+    items = merge(old, catalog.items, catalog.complete, same)
+    count = max(len(old), len(items))
+    table = [["Артикул товара", "Конечная цена"]] + items + [["", ""]] * (count - len(items))
+    state = "ПОЛНЫЙ" if catalog.complete else "НЕПОЛНЫЙ — старые позиции сохранены"
+    details = [["Статус", state], ["Обновлено", datetime.now().astimezone().isoformat(timespec="seconds")],
+       ["Проверено артикулов", len(catalog.items)], ["Артикулов в таблице", len(items)],
+       ["ПВЗ URL", catalog.pvz_url], ["Магазин URL", catalog.store_url],
+       ["Комментарий", "Конец каталога подтверждён" if catalog.complete else "Старые цены могут быть неактуальны"],
+       ["Адрес ПВЗ", catalog.pvz_address]]
+    ranges = [(f"A1:B{count + 1}", table), ("D1:E8", details),
+        ("G1:G3", [["Параметры проверки"], ["Ссылка на магазин"], ["Ссылка на ПВЗ"]]),
+        ("I1:I3", [["По умолчанию"], [DEFAULT_STORE], [DEFAULT_PVZ]])]
+    return ranges, {"checked": len(catalog.items), "rows": len(items), "complete": catalog.complete, "sheet": TAB}
+
+
+def upload_catalog(connection, catalog):
+    session = session_for(connection)
+    try:
+        sid = connection["sheet_id"]
+        check_target(session, sid)
+        old = read_range(session, sid, "A2:B")
+        prev = read_range(session, sid, "E5:E6")
+        ranges, result = prepare_rows(old, prev, catalog)
+        write_ranges(session, sid, ranges)
+        return result
+    finally:
+        session.close()
