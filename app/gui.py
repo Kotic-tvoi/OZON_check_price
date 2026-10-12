@@ -29,7 +29,7 @@ def export_excel(items: list[dict], complete: bool) -> Path:
 
     destination = folder() / "exports"
     destination.mkdir(parents=True, exist_ok=True)
-    suffix = "" if complete else "_НЕПОЛНЫЙ"
+    suffix = ""
     name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     path = destination / f"ozon_{name}{suffix}.xlsx"
     path.write_bytes(to_xlsx(items))
@@ -107,8 +107,28 @@ class PricesApp:
         ttk.Label(parent, text=label, style="Main.TLabel").pack(anchor="w")
         entry = ttk.Entry(parent, textvariable=variable, font=("Segoe UI", 10))
         entry.pack(fill="x", pady=(5, 3))
+        # Force standard Windows clipboard/select-all actions independent of keyboard layout.
+        entry.bind("<Control-v>", lambda e: self._edit_entry(e, "paste"))
+        entry.bind("<Control-V>", lambda e: self._edit_entry(e, "paste"))
+        entry.bind("<Control-c>", lambda e: self._edit_entry(e, "copy"))
+        entry.bind("<Control-C>", lambda e: self._edit_entry(e, "copy"))
+        entry.bind("<Control-x>", lambda e: self._edit_entry(e, "cut"))
+        entry.bind("<Control-X>", lambda e: self._edit_entry(e, "cut"))
+        entry.bind("<Control-a>", lambda e: self._select_all(e))
+        entry.bind("<Control-A>", lambda e: self._select_all(e))
         ttk.Label(parent, text=f"По умолчанию: {example}",
                   style="Note.TLabel").pack(anchor="w", pady=(0, 14))
+
+    @staticmethod
+    def _edit_entry(event, action):
+        event.widget.event_generate("<<" + action.capitalize() + ">>")
+        return "break"
+
+    @staticmethod
+    def _select_all(event):
+        event.widget.select_range(0, "end")
+        event.widget.icursor("end")
+        return "break"
 
     def write_log(self, message):
         self.log.configure(state="normal")
@@ -157,10 +177,6 @@ class PricesApp:
             catalog = collect(store, pvz)
             self.events.put(("log", f"Найдено: {len(catalog.items)}; "
                                       f"время: {catalog.elapsed_seconds} с."))
-            if not catalog.complete:
-                self.events.put(("log", "Внимание: полнота каталога не подтверждена. "
-                                          "Отсутствующие позиции не считаются удалёнными."))
-
             if include_excel:
                 path = export_excel(catalog.items, catalog.complete)
                 self.events.put(("log", f"Excel сохранён: {path}"))
@@ -172,7 +188,7 @@ class PricesApp:
 
             self.events.put(("done", (
                 f"Готово. Проверено: {result['checked']}; в таблице: {result['rows']}. "
-                + ("Каталог полный." if result["complete"] else "Каталог неполный.")
+                + "Выгрузка завершена."
             )))
         except Exception as exc:
             self.events.put(("error", str(exc)))
