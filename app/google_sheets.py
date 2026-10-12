@@ -86,55 +86,20 @@ def normalize(items):
     return output
 
 
-def merge(old, items, complete, same_source):
-    found = normalize(items)
-    if not complete and old and not same_source:
-        raise ValueError("Каталог неполный и магазин/ПВЗ изменён. Старые цены не перезаписаны.")
-    output = {}
-    if not complete:
-        for row in old:
-            if row and SKU.fullmatch(str(row[0])):
-                output[str(row[0])] = row[1] if len(row) > 1 else "Нет данных"
-    for article, price in found.items():
-        if price is not None or article not in output:
-            output[article] = price if price is not None else "Нет данных"
-    return [[key, output[key]] for key in sorted(output, key=int)]
-
-
-def prepare_rows(old, previous, catalog):
-    """Update article/price columns, status fields; never touch employee controls."""
-    previous_store = previous[0][0] if len(previous) >= 1 and previous[0] else ""
-    previous_pvz = previous[1][0] if len(previous) >= 2 and previous[1] else ""
-    same = previous_store == catalog.store_url and previous_pvz == catalog.pvz_url
-    items = merge(old, catalog.items, catalog.complete, same)
-    count = max(len(old), len(items))
-    table = [["Артикул товара", "Конечная цена"]] + items + [["", ""]] * (count - len(items))
-    state = "Готово" if catalog.complete else "Неполный каталог"
-    details = [
-        ["Состояние", state],
-        ["Время проверки", datetime.now().astimezone().isoformat(timespec="seconds")],
-        ["Проверено артикулов", len(catalog.items)],
-        ["Полнота", "Подтверждена" if catalog.complete else "Не подтверждена"],
-        ["Сообщение", "Проверка завершена" if catalog.complete else
-         "Старые отсутствующие позиции сохранены, их цены могут быть неактуальны"],
-        ["Адрес ПВЗ", catalog.pvz_address],
-        ["Магазин URL", catalog.store_url],
-        ["ПВЗ URL", catalog.pvz_url],
-    ]
-    ranges = [(f"A1:B{count + 1}", table), ("D3:E10", details)]
-    return ranges, {"checked": len(catalog.items), "rows": len(items),
-                    "complete": catalog.complete, "sheet": TAB}
-
-
 def upload_catalog(connection, catalog):
+    """Replace only A:B in the selected sheet. Never modify C or any later column."""
+    rows = normalize(catalog.items)
+    items = [[sku, "Нет данных" if price is None else price]
+             for sku, price in sorted(rows.items(), key=lambda x: int(x[0]))]
     session = session_for(connection)
     try:
         sid = connection["sheet_id"]
         check_target(session, sid)
-        old = read_range(session, sid, "A2:B")
-        prev = read_range(session, sid, "E9:E10")
-        ranges, result = prepare_rows(old, prev, catalog)
-        write_ranges(session, sid, ranges)
-        return result
+        old = read_range(session, sid, "A2:A")
+        rows_to_clear = max(len(old), len(items))
+        output = [["Артикул товара", "Конечная цена"]] + items
+        output.extend([["", ""]] * (rows_to_clear - len(items)))
+        write_ranges(session, sid, [(f"A1:B{rows_to_clear + 1}", output)])
+        return {"checked": len(catalog.items), "rows": len(items), "sheet": TAB}
     finally:
         session.close()
