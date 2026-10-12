@@ -89,7 +89,7 @@ def normalize(items):
 def upload_catalog(connection, catalog):
     """Replace only A:B in the selected sheet. Never modify C or any later column."""
     rows = normalize(catalog.items)
-    items = [[sku, "Нет данных" if price is None else price]
+    items = [[int(sku), "Нет данных" if price is None else price]
              for sku, price in sorted(rows.items(), key=lambda x: int(x[0]))]
     session = session_for(connection)
     try:
