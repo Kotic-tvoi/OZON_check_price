@@ -107,28 +107,52 @@ class PricesApp:
         ttk.Label(parent, text=label, style="Main.TLabel").pack(anchor="w")
         entry = ttk.Entry(parent, textvariable=variable, font=("Segoe UI", 10))
         entry.pack(fill="x", pady=(5, 3))
-        # Force standard Windows clipboard/select-all actions independent of keyboard layout.
-        entry.bind("<Control-v>", lambda e: self._edit_entry(e, "paste"))
-        entry.bind("<Control-V>", lambda e: self._edit_entry(e, "paste"))
-        entry.bind("<Control-c>", lambda e: self._edit_entry(e, "copy"))
-        entry.bind("<Control-C>", lambda e: self._edit_entry(e, "copy"))
-        entry.bind("<Control-x>", lambda e: self._edit_entry(e, "cut"))
-        entry.bind("<Control-X>", lambda e: self._edit_entry(e, "cut"))
-        entry.bind("<Control-a>", lambda e: self._select_all(e))
-        entry.bind("<Control-A>", lambda e: self._select_all(e))
+        entry.bind("<Control-KeyPress>", self._control_shortcut)
+        entry.bind("<Shift-Insert>", self._paste_entry)
+        entry.bind("<Button-3>", self._show_edit_menu)
         ttk.Label(parent, text=f"По умолчанию: {example}",
                   style="Note.TLabel").pack(anchor="w", pady=(0, 14))
 
     @staticmethod
-    def _edit_entry(event, action):
-        event.widget.event_generate("<<" + action.capitalize() + ">>")
+    def _paste_entry(event):
+        widget = event.widget
+        try:
+            value = widget.clipboard_get()
+            widget.delete("sel.first", "sel.last") if widget.selection_present() else None
+            widget.insert("insert", value)
+        except tk.TclError:
+            pass
         return "break"
 
     @staticmethod
-    def _select_all(event):
-        event.widget.select_range(0, "end")
-        event.widget.icursor("end")
-        return "break"
+    def _control_shortcut(event):
+        widget = event.widget
+        key = event.keycode
+        if key == 86:  # V (layout-independent Windows keycode)
+            return PricesApp._paste_entry(event)
+        if key == 65:  # A
+            widget.select_range(0, "end")
+            widget.icursor("end")
+            return "break"
+        if key == 67:  # C
+            if widget.selection_present():
+                widget.clipboard_clear()
+                widget.clipboard_append(widget.selection_get())
+            return "break"
+        if key == 88:  # X
+            if widget.selection_present():
+                widget.clipboard_clear()
+                widget.clipboard_append(widget.selection_get())
+                widget.delete("sel.first", "sel.last")
+            return "break"
+
+    def _show_edit_menu(self, event):
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Вставить", command=lambda: self._paste_entry(event))
+        menu.add_command(label="Выделить всё",
+                         command=lambda: event.widget.select_range(0, "end"))
+        menu.tk_popup(event.x_root, event.y_root)
+        menu.grab_release()
 
     def write_log(self, message):
         self.log.configure(state="normal")
@@ -158,12 +182,6 @@ class PricesApp:
         from google_sheets import check_target, load_connection, session_for, upload_catalog
         from scraper import collect
 
-        logger = logging.getLogger("ozon.storefront")
-        handler = UiLogHandler(self.events)
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        old_level = logger.level
-        logger.setLevel(logging.INFO)
-        logger.addHandler(handler)
         try:
             self.events.put(("status", "Проверяем подключение к Google..."))
             connection = load_connection()
@@ -186,15 +204,9 @@ class PricesApp:
                                       f"записано {result['rows']} строк."))
 
 
-            self.events.put(("done", (
-                f"Готово. Проверено: {result['checked']}; в таблице: {result['rows']}. "
-                + "Выгрузка завершена."
-            )))
+            self.events.put(("done", f"Готово. Выгружены цены {result['rows']} товаров."))
         except Exception as exc:
             self.events.put(("error", str(exc)))
-        finally:
-            logger.removeHandler(handler)
-            logger.setLevel(old_level)
 
     def consume_events(self):
         try:
