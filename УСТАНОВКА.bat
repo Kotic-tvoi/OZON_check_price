@@ -10,7 +10,7 @@ if not exist ".venv\Scripts\python.exe" (
 ".venv\Scripts\python.exe" -m pip install -r "app\requirements.txt"
 if errorlevel 1 goto failed
 echo.
-echo Setup complete. Run START.bat.
+echo Setup complete. Run ЗАПУСК.bat.
 pause
 exit /b 0
 :failed
