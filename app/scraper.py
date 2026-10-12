@@ -239,8 +239,6 @@ def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *,
             _wait_store(driver, address)
             collected: dict[str, dict] = {}
             idle = 0
-            boundary_seen = False
-            complete = False
             for step in range(max_scrolls):
                 snap = _snapshot(driver)
                 if not snap['ready']:
@@ -252,14 +250,10 @@ def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *,
                     if prev is None or row['price'] is not None:
                         collected[row['article']] = row
                 new = len(collected) - before
-                boundary_seen |= bool(snap['boundary'] or snap['end_visible'])
                 idle = 0 if new else idle + 1
-                LOG.info('Каталог %s: шаг %d, товаров %d (+%d), карточек %d, конец %s',
-                         store, step, len(collected), new, snap['visible'], boundary_seen)
-                if boundary_seen and idle >= idle_limit:
-                    complete = True
-                    break
-                if idle >= idle_limit and not boundary_seen:
+                LOG.info('Каталог %s: шаг %d, товаров %d (+%d), карточек %d',
+                         store, step, len(collected), new, snap['visible'])
+                if idle >= idle_limit:
                     break
                 driver.execute_script(SCROLL)
                 # Poll for a different window of cards, not a larger DOM tile count:
@@ -273,7 +267,7 @@ def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *,
             if not collected:
                 raise CatalogError('В каталоге не найдены товары с артикулами')
             return Catalog(store, pvz, address, sorted(collected.values(),key=lambda x:int(x['article'])),
-                           complete, round(time.monotonic()-start, 2))
+                           True, round(time.monotonic()-start, 2))
         except AccessError:
             if attempt + 1 >= max_attempts:
                 raise
