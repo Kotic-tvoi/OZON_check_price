@@ -1,51 +1,63 @@
-"""OzonPrices Windows GUI: a single manual run, then upload to Google Sheets.
-
-All URLs are entered here. Blank values mean the default store and Moscow PVZ.
-No background agent, spreadsheet checkbox, Apps Script, or local HTTP server.
-"""
+"""Combined local Ozon and Wildberries price-checking app."""
 from __future__ import annotations
 
-import logging
+import re
 import queue
 import sys
 import threading
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
+from urllib.parse import urlparse
 
 from config import DEFAULT_PVZ, DEFAULT_STORE
 from core import pvz_url, store_url
 
+WB_STORE = "https://www.wildberries.ru/seller/215484/"
+WB_REGIONS = ("Москва", "Санкт-Петербург", "Казань", "Сыктывкар")
 
-def resolved_urls(store_input: str, pvz_input: str) -> tuple[str, str]:
-    return store_url(store_input.strip() or DEFAULT_STORE), pvz_url(pvz_input.strip() or DEFAULT_PVZ)
+
+def suggest_store_name(marketplace: str, url: str) -> str:
+    """Best-effort default; a user may override it for another store."""
+    path = urlparse(url.strip()).path
+    if marketplace == "WB":
+        match = re.fullmatch(r"/seller/(\d+)/?", path)
+        if match:
+            return "JKeratin" if match.group(1) == "215484" else f"seller_{match.group(1)}"
+    else:
+        if path.rstrip("/") in ("/seller/jkeratin",):
+            return "JKeratin"
+        match = re.match(r"/seller/([^/]+)", path)
+        if match:
+            return match.group(1)
+    return "Магазин"
 
 
-def export_excel(items: list[dict], complete: bool) -> Path:
-    from datetime import datetime
-
-    from google_sheets import folder
+def export_excel(items: list[dict], marketplace: str, shop_name: str) -> Path:
     from xlsx_export import to_xlsx
 
-    destination = folder() / "exports"
+    base = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
+    destination = base / "exports"
     destination.mkdir(parents=True, exist_ok=True)
-    suffix = ""
-    name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    path = destination / f"ozon_{name}{suffix}.xlsx"
-    path.write_bytes(to_xlsx(items))
-    return path
-
-
-class UiLogHandler(logging.Handler):
-    def __init__(self, messages):
-        super().__init__()
-        self.messages = messages
-
-    def emit(self, record):
+    clean_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", shop_name).strip(" ._")[:70] or "Магазин"
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    payload = to_xlsx(items, sheet_name=f"Цены {marketplace}")
+    # Exclusive creation avoids accidental replacement, even in the same minute.
+    for number in range(1, 1000):
+        suffix = "" if number == 1 else f"_{number}"
+        path = destination / f"{marketplace}_{clean_name}_{stamp}{suffix}.xlsx"
         try:
-            self.messages.put(("log", self.format(record)))
-        except Exception:
-            self.handleError(record)
+            with path.open("xb") as output:
+                output.write(payload)
+            return path
+        except FileExistsError:
+            continue
+        except OSError:
+            if path.exists():
+                path.unlink(missing_ok=True)
+            raise
+    raise OSError("Не удалось выбрать уникальное имя для файла Excel.")
 
 
 class PricesApp:
@@ -53,13 +65,20 @@ class PricesApp:
         self.root = root
         self.events = queue.Queue()
         self.busy = False
-        self.store = tk.StringVar()
-        self.pvz = tk.StringVar()
+        self.market = tk.StringVar(value="OZON")
+        self.store = tk.StringVar(value=DEFAULT_STORE)
+        self.region = tk.StringVar(value=DEFAULT_PVZ)
+        self.shop_name = tk.StringVar(value="JKeratin")
+        self._auto_store_name = "JKeratin"
         self.save_excel = tk.BooleanVar(value=True)
+        self.compact_chrome = tk.BooleanVar(value=True)
+        # Local-first mode: Google upload is deliberately opt-in.
+        self.upload_google = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Готово к проверке")
-        root.title("OzonPrices — проверка конечных цен")
-        root.geometry("780x610")
-        root.minsize(700, 535)
+
+        root.title("Проверка цен OZON и WB")
+        root.geometry("800x650")
+        root.minsize(720, 585)
         root.configure(bg="#F5F7FB")
         root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -76,49 +95,113 @@ class PricesApp:
 
         panel = ttk.Frame(root, style="Main.TFrame", padding=22)
         panel.pack(fill="both", expand=True)
-        ttk.Label(panel, text="Проверка цен Ozon", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(panel, text="Откроется Chrome, затем цены автоматически появятся в Google Таблице.",
-                  style="Note.TLabel").pack(anchor="w", pady=(3, 17))
+        ttk.Label(panel, text="Проверка цен маркетплейсов",
+                  style="Title.TLabel").pack(anchor="w")
+        ttk.Label(panel, text="Сначала соберите данные локально. Выгрузка в Google Таблицу выключена по умолчанию.",
+                  style="Note.TLabel", wraplength=740).pack(anchor="w", pady=(3, 15))
 
-        self.add_input(panel, "Ссылка на магазин Ozon", self.store, DEFAULT_STORE)
-        self.add_input(panel, "Ссылка на пункт выдачи (ПВЗ)", self.pvz, DEFAULT_PVZ)
+        ttk.Label(panel, text="Маркетплейс", style="Main.TLabel").pack(anchor="w")
+        self.market_choice = ttk.Combobox(panel, textvariable=self.market,
+                                          values=("OZON", "WB"),
+                                          state="readonly", font=("Segoe UI", 10))
+        self.market_choice.pack(fill="x", pady=(5, 13))
+        self.market_choice.bind("<<ComboboxSelected>>", self.on_market_change)
 
-        ttk.Checkbutton(panel, text="Сохранить Excel на компьютере (рекомендуется)",
-                        variable=self.save_excel).pack(anchor="w", pady=(7, 12))
+        self.store_label = ttk.Label(panel, text="Ссылка на магазин OZON",
+                                     style="Main.TLabel")
+        self.store_label.pack(anchor="w")
+        self.store_entry = ttk.Entry(panel, textvariable=self.store, font=("Segoe UI", 10))
+        self.store_entry.pack(fill="x", pady=(5, 3))
+        self._bind_editing(self.store_entry)
+        self.store_entry.bind("<FocusOut>", self._update_store_name)
+
+        self.region_label = ttk.Label(panel, text="Ссылка на пункт выдачи (ПВЗ) OZON",
+                                      style="Main.TLabel")
+        self.region_label.pack(anchor="w", pady=(11, 0))
+        self.region_entry = ttk.Combobox(panel, textvariable=self.region, values=(), font=("Segoe UI", 10))
+        self.region_entry.pack(fill="x", pady=(5, 3))
+        self._bind_editing(self.region_entry)
+        self.region_note = ttk.Label(panel, text="Для OZON укажите ссылку на ПВЗ.",
+                                     style="Note.TLabel")
+        self.region_note.pack(anchor="w", pady=(0, 10))
+
+        ttk.Label(panel, text="Название магазина для файла Excel", style="Main.TLabel").pack(anchor="w")
+        self.shop_entry = ttk.Entry(panel, textvariable=self.shop_name, font=("Segoe UI", 10))
+        self.shop_entry.pack(fill="x", pady=(5, 10))
+        self._bind_editing(self.shop_entry)
+
+        self.compact_check = ttk.Checkbutton(
+            panel, text="Компактное окно Chrome (OZON)",
+            variable=self.compact_chrome)
+        self.compact_check.pack(anchor="w", pady=(0, 4))
+        ttk.Checkbutton(panel, text="Сохранить Excel в папку exports",
+                        variable=self.save_excel).pack(anchor="w", pady=(2, 3))
+        self.google_check = ttk.Checkbutton(
+            panel, text="Отправить результат OZON в Google Таблицу (необязательно)",
+            variable=self.upload_google)
+        self.google_check.pack(anchor="w", pady=(2, 10))
 
         actions = ttk.Frame(panel, style="Main.TFrame")
         actions.pack(fill="x", pady=(0, 12))
-        self.start_button = ttk.Button(actions, text="Проверить цены и отправить",
+        self.start_button = ttk.Button(actions, text="Проверить цены",
                                        style="Run.TButton", command=self.start)
         self.start_button.pack(side="left")
         ttk.Label(actions, textvariable=self.status, style="Main.TLabel",
-                  wraplength=370).pack(side="left", padx=(18, 0))
+                  wraplength=390).pack(side="left", padx=(18, 0))
         ttk.Label(panel, text="Ход проверки", style="Main.TLabel").pack(anchor="w")
         self.log = scrolledtext.ScrolledText(panel, height=12, font=("Consolas", 9),
                                              wrap="word", state="disabled",
                                              relief="flat", bg="#FFFFFF",
                                              fg="#27384B", padx=10, pady=9)
         self.log.pack(fill="both", expand=True, pady=(6, 0))
-        self.write_log("Пустые поля используют магазин JKeratin и московский ПВЗ.")
-        self.write_log("Для начала нажмите «Проверить цены и отправить».")
+        self.write_log("Выберите маркетплейс и проверьте ссылку магазина и регион.")
+        self.write_log("WB: тестовый режим с отдельным Chrome; получение цен пока не подтверждено.")
         root.after(120, self.consume_events)
 
-    def add_input(self, parent, label, variable, example):
-        ttk.Label(parent, text=label, style="Main.TLabel").pack(anchor="w")
-        entry = ttk.Entry(parent, textvariable=variable, font=("Segoe UI", 10))
-        entry.pack(fill="x", pady=(5, 3))
+    def _bind_editing(self, entry):
         entry.bind("<Control-KeyPress>", self._control_shortcut)
         entry.bind("<Shift-Insert>", self._paste_entry)
         entry.bind("<Button-3>", self._show_edit_menu)
-        ttk.Label(parent, text=f"По умолчанию: {example}",
-                  style="Note.TLabel").pack(anchor="w", pady=(0, 14))
+
+    def on_market_change(self, _event=None):
+        if self.market.get() == "WB":
+            self.store.set(WB_STORE)
+            self.shop_name.set("JKeratin")
+            self._auto_store_name = "JKeratin"
+            self.region.set("Москва")
+            self.region_entry.configure(values=WB_REGIONS)
+            self.store_label.configure(text="Ссылка на магазин WB")
+            self.region_label.configure(text="Город доставки WB")
+            self.region_note.configure(
+                text="Выберите город из списка или введите числовой код dest. Это регион, не конкретный ПВЗ.")
+            self.compact_check.configure(state="disabled")
+            self.google_check.configure(state="disabled")
+            self.upload_google.set(False)
+        else:
+            self.store.set(DEFAULT_STORE)
+            self.region.set(DEFAULT_PVZ)
+            self.region_entry.configure(values=())
+            self.store_label.configure(text="Ссылка на магазин OZON")
+            self.region_label.configure(text="Ссылка на пункт выдачи (ПВЗ) OZON")
+            self.region_note.configure(text="Для OZON укажите ссылку на ПВЗ.")
+            self.compact_check.configure(state="normal")
+            self.google_check.configure(state="normal")
+        self.shop_name.set("JKeratin")
+        self._auto_store_name = "JKeratin"
+
+    def _update_store_name(self, _event=None):
+        suggested = suggest_store_name(self.market.get(), self.store.get())
+        if not self.shop_name.get().strip() or self.shop_name.get() == self._auto_store_name:
+            self.shop_name.set(suggested)
+        self._auto_store_name = suggested
 
     @staticmethod
     def _paste_entry(event):
         widget = event.widget
         try:
             value = widget.clipboard_get()
-            widget.delete("sel.first", "sel.last") if widget.selection_present() else None
+            if widget.selection_present():
+                widget.delete("sel.first", "sel.last")
             widget.insert("insert", value)
         except tk.TclError:
             pass
@@ -128,22 +211,20 @@ class PricesApp:
     def _control_shortcut(event):
         widget = event.widget
         key = event.keycode
-        if key == 86:  # V (layout-independent Windows keycode)
+        if key == 86:
             return PricesApp._paste_entry(event)
-        if key == 65:  # A
+        if key == 65:
             widget.select_range(0, "end")
             widget.icursor("end")
             return "break"
-        if key == 67:  # C
-            if widget.selection_present():
-                widget.clipboard_clear()
-                widget.clipboard_append(widget.selection_get())
+        if key == 67 and widget.selection_present():
+            widget.clipboard_clear()
+            widget.clipboard_append(widget.selection_get())
             return "break"
-        if key == 88:  # X
-            if widget.selection_present():
-                widget.clipboard_clear()
-                widget.clipboard_append(widget.selection_get())
-                widget.delete("sel.first", "sel.last")
+        if key == 88 and widget.selection_present():
+            widget.clipboard_clear()
+            widget.clipboard_append(widget.selection_get())
+            widget.delete("sel.first", "sel.last")
             return "break"
 
     def _show_edit_menu(self, event):
@@ -163,48 +244,68 @@ class PricesApp:
     def start(self):
         if self.busy:
             return
+        self._update_store_name()
+        marketplace = self.market.get()
+        shop_name = self.shop_name.get().strip()
+        if not shop_name:
+            messagebox.showerror("Проверьте данные", "Укажите название магазина для файла Excel.")
+            return
         try:
-            store, pvz = resolved_urls(self.store.get(), self.pvz.get())
+            if marketplace == "OZON":
+                store, region = store_url(self.store.get().strip() or DEFAULT_STORE), pvz_url(
+                    self.region.get().strip() or DEFAULT_PVZ)
+            else:
+                from wb_scraper import normalize_destination, normalize_store_url, DESTINATIONS
+                store = normalize_store_url(self.store.get())
+                selected = self.region.get().strip()
+                region = normalize_destination(DESTINATIONS.get(selected, selected))
         except ValueError as exc:
-            messagebox.showerror("Неверная ссылка", str(exc))
+            messagebox.showerror("Проверьте данные", str(exc))
             return
         self.busy = True
         self.start_button.configure(state="disabled")
         self.status.set("Подготовка...")
+        self.write_log(f"Маркетплейс: {marketplace}")
         self.write_log(f"Магазин: {store}")
-        self.write_log(f"ПВЗ: {pvz}")
-        thread = threading.Thread(target=self.collect_and_upload,
-                                  args=(store, pvz, bool(self.save_excel.get())),
-                                  daemon=True)
+        self.write_log(f"Имя для Excel: {shop_name}")
+        self.write_log(f"Регион/ПВЗ: {region}")
+        thread = threading.Thread(
+            target=self.collect_prices,
+            args=(marketplace, store, region, bool(self.save_excel.get()),
+                  bool(self.upload_google.get()), shop_name, bool(self.compact_chrome.get())),
+            daemon=True,
+        )
         thread.start()
 
-    def collect_and_upload(self, store, pvz, include_excel):
-        from google_sheets import check_target, load_connection, session_for, upload_catalog
-        from scraper import collect
-
+    def collect_prices(self, marketplace, store, region, include_excel, include_google, shop_name, compact_chrome):
         try:
-            self.events.put(("status", "Проверяем подключение к Google..."))
-            connection = load_connection()
-            http = session_for(connection)
-            try:
-                check_target(http, connection["sheet_id"])
-            finally:
-                http.close()
-
-            self.events.put(("status", "Собираем цены в Chrome..."))
-            catalog = collect(store, pvz)
-            self.events.put(("log", f"Найдено: {len(catalog.items)}; "
-                                      f"время: {catalog.elapsed_seconds} с."))
+            if marketplace == "OZON":
+                from scraper import collect
+                self.events.put(("status", "Открываем Chrome для OZON..."))
+                def report(message):
+                    self.events.put(("status", message))
+                    self.events.put(("log", "[OZON] " + message))
+                catalog = collect(store, region, progress=report, compact_window=compact_chrome)
+            else:
+                from wb_scraper import collect
+                def report_wb(message):
+                    self.events.put(("status", message))
+                    self.events.put(("log", "[WB] " + message))
+                self.events.put(("status", "Открываем магазин WB в отдельном Chrome..."))
+                catalog = collect(store, region, progress=report_wb)
+            self.events.put(("log", f"Найдено товаров: {len(catalog.items)}"))
             if include_excel:
-                path = export_excel(catalog.items, catalog.complete)
+                path = export_excel(catalog.items, marketplace, shop_name)
                 self.events.put(("log", f"Excel сохранён: {path}"))
-            self.events.put(("status", "Отправляем данные в Google Таблицу..."))
-            result = upload_catalog(connection, catalog)
-            self.events.put(("log", f"Google Таблица, лист «{result['sheet']}»: "
-                                      f"записано {result['rows']} строк."))
-
-
-            self.events.put(("done", f"Готово. Выгружены цены {result['rows']} товаров."))
+            if include_google:
+                if marketplace != "OZON":
+                    raise ValueError("Выгрузка WB в Google Таблицу будет добавлена после локального теста.")
+                from google_sheets import load_connection, upload_catalog
+                self.events.put(("status", "Отправляем данные OZON в Google Таблицу..."))
+                connection = load_connection()
+                result = upload_catalog(connection, catalog)
+                self.events.put(("log", f"В Google Таблицу записано строк: {result['rows']}."))
+            self.events.put(("done", f"Готово. Проверено товаров: {len(catalog.items)}."))
         except Exception as exc:
             self.events.put(("error", str(exc)))
 
@@ -244,6 +345,7 @@ def main():
     if "--check-build" in sys.argv:
         import google.auth
         import selenium
+        import requests
         destination = Path(sys.argv[sys.argv.index("--check-build") + 1])
         destination.write_text("OK", encoding="utf-8")
         return

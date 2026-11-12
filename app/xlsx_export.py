@@ -1,10 +1,11 @@
 """Optional two-column Excel response created in memory (stdlib only)."""
 from io import BytesIO
-from xml.sax.saxutils import escape
+from xml.sax.saxutils import escape, quoteattr
 from zipfile import ZipFile, ZIP_DEFLATED
 
 
-def to_xlsx(rows: list[dict]) -> bytes:
+def to_xlsx(rows: list[dict], sheet_name: str = "Цены") -> bytes:
+    safe_name = "".join("_" if ch in '[]:*?/\\' else ch for ch in sheet_name).strip("'")[:31] or "Цены"
     def cell(ref, value):
         if value is None:
             return ''
@@ -31,7 +32,7 @@ def to_xlsx(rows: list[dict]) -> bytes:
             '</Relationships>'),
         'xl/workbook.xml': ('<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
             'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-            '<sheets><sheet name="OZON Prices" sheetId="1" r:id="rId1"/></sheets></workbook>'),
+            '<sheets><sheet name=' + quoteattr(safe_name) + ' sheetId="1" r:id="rId1"/></sheets></workbook>'),
         'xl/_rels/workbook.xml.rels': ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
             '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
             'Target="worksheets/sheet1.xml"/></Relationships>'),
