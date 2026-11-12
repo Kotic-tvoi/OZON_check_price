@@ -10,7 +10,7 @@ from typing import Callable
 
 from config import (DEFAULT_PVZ, DEFAULT_STORE, LOAD_TIMEOUT, IDLE_LIMIT,
                     MAX_SCROLLS, CAPTCHA_MAX_ATTEMPTS, SCROLL_POLL_INTERVAL,
-                    CHROME_WINDOW_SIZE, PAGE_LOAD_TIMEOUT, PVZ_READY_TIMEOUT,
+                    PAGE_LOAD_TIMEOUT, PVZ_READY_TIMEOUT,
                     PVZ_POLL_INTERVAL, PVZ_CLICK_TIMEOUT, PVZ_RETRY_TIMEOUT,
                     STORE_READY_TIMEOUT, STORE_POLL_INTERVAL)
 from core import pvz_url, store_url
@@ -108,16 +108,13 @@ def compact_chrome_geometry() -> tuple[int, int, int, int]:
         return 1100, 760, 20, 20
 
 
-def create_driver(*, compact_window: bool = True):
+def create_driver():
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     options = Options()
-    if compact_window:
-        width, height, x, y = compact_chrome_geometry()
-        options.add_argument(f'--window-size={width},{height}')
-        options.add_argument(f'--window-position={x},{y}')
-    else:
-        options.add_argument(f'--window-size={CHROME_WINDOW_SIZE}')
+    width, height, x, y = compact_chrome_geometry()
+    options.add_argument(f'--window-size={width},{height}')
+    options.add_argument(f'--window-position={x},{y}')
     # Keep Chrome visible; headless mode caused access problems on the test machine.
     options.add_argument('--disable-blink-features=AutomationControlled')
     options.add_argument('--no-proxy-server')
@@ -260,8 +257,7 @@ def _snapshot(driver) -> dict:
 def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *,
             load_timeout: float = LOAD_TIMEOUT, idle_limit: int = IDLE_LIMIT,
             max_scrolls: int = MAX_SCROLLS, max_attempts: int = CAPTCHA_MAX_ATTEMPTS,
-            progress: Callable[[str], None] | None = None,
-            compact_window: bool = True) -> Catalog:
+            progress: Callable[[str], None] | None = None) -> Catalog:
     """Read all visible/lazy-loaded catalog tiles in one Chrome, no database."""
     store, pvz = store_url(store), pvz_url(pvz)
     if load_timeout <= 0 or idle_limit < 1 or max_scrolls < 1 or max_attempts < 1:
@@ -276,7 +272,7 @@ def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *,
         driver = None
         try:
             notify("Запускаем Chrome...")
-            driver = create_driver(compact_window=compact_window)
+            driver = create_driver()
             notify("Выбираем ПВЗ...")
             address = set_pvz(driver, pvz)
             notify("Открываем каталог OZON...")
