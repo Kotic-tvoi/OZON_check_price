@@ -7,6 +7,7 @@ stops with a clear error when Wildberries denies or rate-limits access.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -14,6 +15,9 @@ from typing import Callable
 from urllib.parse import urlparse
 
 import requests
+
+from config import PAGE_LOAD_TIMEOUT
+from scraper import compact_chrome_geometry
 
 LOG = logging.getLogger("wb.catalog")
 CATALOG_URL = "https://www.wildberries.ru/__internal/catalog/sellers/v4/catalog"
@@ -101,7 +105,9 @@ def _read_products(payload: dict) -> list[dict]:
 
 
 def prepare_browser_session(session: requests.Session, store: str,
-                            progress: Callable[[str], None] | None = None) -> None:
+                            progress: Callable[[str], None] | None = None,
+                            manual_login: bool = False,
+                            wait_for_login: Callable[[], bool] | None = None) -> None:
     """Open a disposable Chrome profile and reuse only WB session cookies in memory.
 
     No existing Windows/Chrome browser profile is read or changed. This does NOT
@@ -114,31 +120,61 @@ def prepare_browser_session(session: requests.Session, store: str,
     if progress:
         progress("Открываем магазин WB в Chrome...")
     options = Options()
-    options.page_load_strategy = "eager"
-    options.add_argument("--window-size=1000,750")
+    width, height, x, y = compact_chrome_geometry()
+    options.add_argument(f"--window-size={width},{height}")
+    options.add_argument(f"--window-position={x},{y}")
+    # Match the currently working OZON Chrome launch options for the comparison.
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--no-proxy-server")
     options.add_argument("--disable-extensions")
+    options.add_experimental_option("prefs", {
+        "profile.managed_default_content_settings.images": 2,
+    })
+    options.page_load_strategy = "eager"
+    if os.getenv("OZON_CHROME_BINARY"):
+        options.binary_location = os.environ["OZON_CHROME_BINARY"]
     driver = None
     try:
         driver = webdriver.Chrome(options=options)
-        driver.set_page_load_timeout(25)
+        driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
         driver.get(store)
         WebDriverWait(driver, 12, poll_frequency=0.3).until(
             lambda browser: browser.execute_script(
                 "return document.readyState === 'complete' || document.readyState === 'interactive'"
             )
         )
-        # Keep Chrome visible long enough to inspect any warning or access page.
-        if progress:
-            progress("Окно WB останется открытым 15 секунд для проверки страницы...")
-        time.sleep(15)
-        # Detect a challenge page before attempting to reuse its cookies.
-        # This is a fail-closed check, not an attempt to bypass the restriction.
-        page_text = (driver.execute_script(
-            "return (document.body && document.body.innerText || '').slice(0,6000)"
-        ) or "").casefold()
-        if ("подозрительная активность" in page_text
+        def blocked_page() -> bool:
+            page_text = (driver.execute_script(
+                "return (document.body && document.body.innerText || '').slice(0,6000)"
+            ) or "").casefold()
+            return (
+                "подозрительная активность" in page_text
                 or ("что-то не так" in page_text and "пожалуйста, подождите" in page_text)
-                or "новая попытка через" in page_text):
+                or "новая попытка через" in page_text
+            )
+
+        if manual_login:
+            if blocked_page():
+                if progress:
+                    progress("WB сразу показал страницу ограничения. Окно останется открытым 15 секунд...")
+                time.sleep(15)
+            else:
+                if progress:
+                    progress("При необходимости войдите или зарегистрируйтесь в Chrome вручную, затем нажмите «Готово — продолжить» в приложении.")
+                if wait_for_login is None or not wait_for_login():
+                    raise WBAccessError(
+                        "Вход в WB не был подтверждён в приложении за 3 минуты. "
+                        "Проверка остановлена, cookies не переданы."
+                    )
+                # Return to the store page in the same authorized browser session.
+                driver.get(store)
+        else:
+            if progress:
+                progress("Окно WB останется открытым 15 секунд для проверки страницы...")
+            time.sleep(15)
+
+        # Never reuse a protective challenge page's cookies as a successful session.
+        if blocked_page():
             raise WBAccessError(
                 "WB показывает защитную страницу «Подозрительная активность» ещё "
                 "при открытии магазина в Chrome. Сбор цен остановлен; cookies "
@@ -157,7 +193,7 @@ def prepare_browser_session(session: requests.Session, store: str,
             )
             count += 1
         if progress:
-            progress("Браузерная сессия WB подготовлена. Проверяем доступ к каталогу...")
+            progress("Сессия WB подготовлена. Проверяем доступ к каталогу...")
         LOG.info("WB browser session initialized with %d site cookies (values not logged)", count)
     except WBAccessError:
         raise
@@ -172,7 +208,9 @@ def prepare_browser_session(session: requests.Session, store: str,
 
 def collect(store: str, destination: str = DEFAULT_DEST, *,
             max_pages: int = MAX_PAGES, timeout: int = REQUEST_TIMEOUT,
-            progress: Callable[[str], None] | None = None) -> WBCatalog:
+            progress: Callable[[str], None] | None = None,
+            manual_login: bool = False,
+            wait_for_login: Callable[[], bool] | None = None) -> WBCatalog:
     store = normalize_store_url(store)
     destination = normalize_destination(destination)
     if not 1 <= max_pages <= MAX_PAGES:
@@ -191,7 +229,10 @@ def collect(store: str, destination: str = DEFAULT_DEST, *,
     started = time.monotonic()
     seen: dict[str, dict] = {}
     try:
-        prepare_browser_session(session, store, progress)
+        prepare_browser_session(
+            session, store, progress,
+            manual_login=manual_login, wait_for_login=wait_for_login
+        )
         for page in range(1, max_pages + 1):
             params = {
                 "ab_testing": "false",
