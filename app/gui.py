@@ -15,7 +15,6 @@ from config import DEFAULT_PVZ, DEFAULT_STORE
 from core import pvz_url, store_url
 
 WB_STORE = "https://www.wildberries.ru/seller/215484/"
-WB_DEST = "-1257786"
 WB_REGIONS = ("Москва", "Санкт-Петербург", "Казань", "Сыктывкар")
 
 
