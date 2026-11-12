@@ -41,7 +41,7 @@ def export_excel(items: list[dict], marketplace: str, shop_name: str) -> Path:
     destination = base / "exports"
     destination.mkdir(parents=True, exist_ok=True)
     clean_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", shop_name).strip(" ._")[:70] or "Магазин"
-    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    stamp = datetime.now().strftime("%d-%m-%Y_%H-%M")
     payload = to_xlsx(items, sheet_name=f"Цены {marketplace}")
     # Exclusive creation avoids accidental replacement, even in the same minute.
     for number in range(1, 1000):
@@ -71,7 +71,6 @@ class PricesApp:
         self.shop_name = tk.StringVar(value="JKeratin")
         self._auto_store_name = "JKeratin"
         self.save_excel = tk.BooleanVar(value=True)
-        self.compact_chrome = tk.BooleanVar(value=True)
         # Local-first mode: Google upload is deliberately opt-in.
         self.upload_google = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Готово к проверке")
@@ -130,10 +129,6 @@ class PricesApp:
         self.shop_entry.pack(fill="x", pady=(5, 10))
         self._bind_editing(self.shop_entry)
 
-        self.compact_check = ttk.Checkbutton(
-            panel, text="Компактное окно Chrome (OZON)",
-            variable=self.compact_chrome)
-        self.compact_check.pack(anchor="w", pady=(0, 4))
         ttk.Checkbutton(panel, text="Сохранить Excel в папку exports",
                         variable=self.save_excel).pack(anchor="w", pady=(2, 3))
         self.google_check = ttk.Checkbutton(
@@ -174,7 +169,6 @@ class PricesApp:
             self.region_label.configure(text="Город доставки WB")
             self.region_note.configure(
                 text="Выберите город из списка или введите числовой код dest. Это регион, не конкретный ПВЗ.")
-            self.compact_check.configure(state="disabled")
             self.google_check.configure(state="disabled")
             self.upload_google.set(False)
         else:
@@ -184,7 +178,6 @@ class PricesApp:
             self.store_label.configure(text="Ссылка на магазин OZON")
             self.region_label.configure(text="Ссылка на пункт выдачи (ПВЗ) OZON")
             self.region_note.configure(text="Для OZON укажите ссылку на ПВЗ.")
-            self.compact_check.configure(state="normal")
             self.google_check.configure(state="normal")
         self.shop_name.set("JKeratin")
         self._auto_store_name = "JKeratin"
@@ -272,12 +265,12 @@ class PricesApp:
         thread = threading.Thread(
             target=self.collect_prices,
             args=(marketplace, store, region, bool(self.save_excel.get()),
-                  bool(self.upload_google.get()), shop_name, bool(self.compact_chrome.get())),
+                  bool(self.upload_google.get()), shop_name),
             daemon=True,
         )
         thread.start()
 
-    def collect_prices(self, marketplace, store, region, include_excel, include_google, shop_name, compact_chrome):
+    def collect_prices(self, marketplace, store, region, include_excel, include_google, shop_name):
         try:
             if marketplace == "OZON":
                 from scraper import collect
@@ -285,7 +278,7 @@ class PricesApp:
                 def report(message):
                     self.events.put(("status", message))
                     self.events.put(("log", "[OZON] " + message))
-                catalog = collect(store, region, progress=report, compact_window=compact_chrome)
+                catalog = collect(store, region, progress=report)
             else:
                 from wb_scraper import collect
                 def report_wb(message):
