@@ -8,7 +8,7 @@ Windows desktop app for collecting storefront prices from OZON and WB.
 - Enter a seller page and a delivery location.
 - Save results as `OZON_JKeratin_DD-MM-YYYY_HH-MM.xlsx` or `WB_JKeratin_DD-MM-YYYY_HH-MM.xlsx` in `exports`. The store label can be edited in the interface. Repeated exports in the same minute receive `_2`, `_3`, etc.
 - Google Sheets upload is optional and disabled by default so the first checks run locally.
-- WB (experimental): the app opens its own temporary Chrome session on the public seller page, reads only WB cookies from that session into memory and attempts the internal catalog request once. The temporary browser is closed; its cookies are not saved to the repository, files, logs, or another service. This approach is **not yet verified to work**; HTTP 403 may persist even with cookies, in which case the parser stops with a clear error.
+- WB (experimental): the app opens its own temporary Chrome session on the public seller page, using the same visible Chrome launch settings as OZON. If the WB page loads normally, it reads only WB cookies from that session into memory and requests the catalog. An optional **Ручной вход в WB** checkbox lets the user sign in or register themselves in the opened browser (no automated account creation, password capture or SMS handling) and then press **Готово — продолжить** in the app. If WB shows a protective challenge, the parser stops without reusing those cookies. A session or login does not guarantee API access; HTTP 403 may still occur.
 
 For WB, pick Moscow, Saint Petersburg, Kazan or Syktyvkar from the dropdown, or type a numeric `dest` value. Default is the JKeratin seller and Moscow (`-1257786`). This selects a region, not a specific pickup point. A true PVZ-level selection needs a separate validation against WB's location flow and should not be inferred from the `dest` code.
 
@@ -29,8 +29,8 @@ The OZON parser always opens a smaller visible Chrome window positioned on the r
 
 ## WB browser-session test
 
-- WB uses its **own** Selenium-launched browser, not cookies from your personal Chrome profile. Do not log into a personal WB account for this test.
-- The application keeps the WB Chrome window open for 15 seconds after the page loads, so you can inspect any message, and then closes it automatically after collecting session cookies. Cookies are used only in process memory to request the catalog.
+- WB uses its **own** Selenium-launched browser, not cookies from your existing Chrome profile. It matches OZON launch options (compact visible window, no proxy server, no extensions, images disabled, eager page load, and the same browser flags).
+- By default the WB Chrome window remains open for 15 seconds so you can inspect any message. Optionally, turn on **Ручной вход в WB (при необходимости)** before starting. If the store page opens without a protection warning, manually sign in or register in that browser and click **Готово — продолжить** in the application within 3 minutes. No password or phone verification code is collected by the application. The temporary browser is automatically closed after reading session cookies; they stay in memory only and are never added to the repository or logs.
 - The test proves whether this particular endpoint accepts a fresh browser session. It does not confirm PVZ-level selection: `dest` remains a region code.
 - If WB returns HTTP 403, stop and revisit the acquisition approach. Do not paste authentication cookies or tokens into support chats or GitHub issues.
 
