@@ -23,7 +23,7 @@ def suggest_store_name(marketplace: str, url: str) -> str:
     """Best-effort default; a user may override it for another store."""
     path = urlparse(url.strip()).path
     if marketplace == "WB":
-        match = re.fullmatch(r"/seller/(\\d+)/?", path)
+        match = re.fullmatch(r"/seller/(\d+)/?", path)
         if match:
             return "JKeratin" if match.group(1) == "215484" else f"seller_{match.group(1)}"
     else:
@@ -41,7 +41,7 @@ def export_excel(items: list[dict], marketplace: str, shop_name: str) -> Path:
     base = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
     destination = base / "exports"
     destination.mkdir(parents=True, exist_ok=True)
-    clean_name = re.sub(r'[<>:"/\\\\|?*\\x00-\\x1f]', "_", shop_name).strip(" ._")[:70] or "Магазин"
+    clean_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", shop_name).strip(" ._")[:70] or "Магазин"
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
     payload = to_xlsx(items, sheet_name=f"Цены {marketplace}")
     # Exclusive creation avoids accidental replacement, even in the same minute.
@@ -162,6 +162,8 @@ class PricesApp:
     def on_market_change(self, _event=None):
         if self.market.get() == "WB":
             self.store.set(WB_STORE)
+            self.shop_name.set("JKeratin")
+            self._auto_store_name = "JKeratin"
             self.region.set("Москва")
             self.region_entry.configure(values=WB_REGIONS)
             self.store_label.configure(text="Ссылка на магазин WB")
@@ -247,9 +249,10 @@ class PricesApp:
                 store, region = store_url(self.store.get().strip() or DEFAULT_STORE), pvz_url(
                     self.region.get().strip() or DEFAULT_PVZ)
             else:
-                from wb_scraper import normalize_destination, normalize_store_url
+                from wb_scraper import normalize_destination, normalize_store_url, DESTINATIONS
                 store = normalize_store_url(self.store.get())
-                region = normalize_destination(self.region.get())
+                selected = self.region.get().strip()
+                region = normalize_destination(DESTINATIONS.get(selected, selected))
         except ValueError as exc:
             messagebox.showerror("Проверьте данные", str(exc))
             return
