@@ -10,6 +10,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from typing import Callable
 from urllib.parse import urlparse
 
 import requests
@@ -99,15 +100,66 @@ def _read_products(payload: dict) -> list[dict]:
     return rows
 
 
+def prepare_browser_session(session: requests.Session, store: str,
+                            progress: Callable[[str], None] | None = None) -> None:
+    """Open a disposable Chrome profile and reuse only WB session cookies in memory.
+
+    No existing Windows/Chrome browser profile is read or changed. This does NOT
+    guarantee the restricted internal WB endpoint will accept the API request.
+    """
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    if progress:
+        progress("Открываем магазин WB в Chrome...")
+    options = Options()
+    options.page_load_strategy = "eager"
+    options.add_argument("--window-size=1000,750")
+    options.add_argument("--disable-extensions")
+    driver = None
+    try:
+        driver = webdriver.Chrome(options=options)
+        driver.set_page_load_timeout(25)
+        driver.get(store)
+        WebDriverWait(driver, 12, poll_frequency=0.3).until(
+            lambda browser: browser.execute_script(
+                "return document.readyState === 'complete' || document.readyState === 'interactive'"
+            )
+        )
+        cookies = driver.get_cookies()
+        count = 0
+        for cookie in cookies:
+            domain = str(cookie.get("domain", "")).lstrip(".").lower()
+            if domain not in ("wildberries.ru", "www.wildberries.ru") or not cookie.get("name"):
+                continue
+            session.cookies.set(
+                cookie["name"], cookie.get("value", ""),
+                domain=cookie["domain"], path=cookie.get("path") or "/"
+            )
+            count += 1
+        if progress:
+            progress("Браузерная сессия WB подготовлена. Проверяем доступ к каталогу...")
+        LOG.info("WB browser session initialized with %d site cookies (values not logged)", count)
+    except Exception as exc:
+        raise WBAccessError(
+            "Не удалось открыть магазин WB в Chrome. Проверьте доступность сайта в браузере."
+        ) from exc
+    finally:
+        if driver:
+            driver.quit()
+
+
 def collect(store: str, destination: str = DEFAULT_DEST, *,
-            max_pages: int = MAX_PAGES, timeout: int = REQUEST_TIMEOUT) -> WBCatalog:
+            max_pages: int = MAX_PAGES, timeout: int = REQUEST_TIMEOUT,
+            progress: Callable[[str], None] | None = None) -> WBCatalog:
     store = normalize_store_url(store)
     destination = normalize_destination(destination)
     if not 1 <= max_pages <= MAX_PAGES:
         raise ValueError(f"Число страниц должно быть от 1 до {MAX_PAGES}.")
     seller_id = re.search(r"/seller/(\d+)/", store).group(1)
     session = requests.Session()
-    # No Cookie / Authorization headers and no browser session are used.
+    # Cookies from the temporary browser session remain in memory, never on disk.
     session.headers.update({
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7",
@@ -119,6 +171,7 @@ def collect(store: str, destination: str = DEFAULT_DEST, *,
     started = time.monotonic()
     seen: dict[str, dict] = {}
     try:
+        prepare_browser_session(session, store, progress)
         for page in range(1, max_pages + 1):
             params = {
                 "ab_testing": "false",
@@ -140,8 +193,9 @@ def collect(store: str, destination: str = DEFAULT_DEST, *,
                 raise WBAccessError("Не удалось подключиться к Wildberries. Проверьте интернет и повторите попытку.") from exc
             if response.status_code in (401, 403, 429):
                 raise WBAccessError(
-                    f"WB вернул HTTP {response.status_code}: доступ к внутреннему каталогу ограничен. "
-                    "Проверка цен не выполнена. Повторные запросы не помогут, пока WB не предоставит доступ к этому источнику."
+                    f"WB вернул HTTP {response.status_code} даже после открытия магазина в Chrome. "
+                    "Cookies этой сессии недостаточно для доступа к каталогу. "
+                    "Проверка остановлена; данные цен не получены."
                 )
             if response.status_code != 200:
                 raise WBAccessError(f"Wildberries вернул HTTP {response.status_code}.")
@@ -157,6 +211,8 @@ def collect(store: str, destination: str = DEFAULT_DEST, *,
             for row in products:
                 seen[row["article"]] = row
             LOG.info("WB page %s: %s products; total %s", page, len(products), len(seen))
+            if progress and (page == 1 or page % 5 == 0):
+                progress(f"WB: собрано товаров {len(seen)}")
             time.sleep(PAGE_DELAY)
         if not seen:
             raise WBCatalogError("В открытом каталоге не найдены товары с ценами.")
