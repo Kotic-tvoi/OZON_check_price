@@ -140,8 +140,8 @@ def collect(store: str, destination: str = DEFAULT_DEST, *,
                 raise WBAccessError("Не удалось подключиться к Wildberries. Проверьте интернет и повторите попытку.") from exc
             if response.status_code in (401, 403, 429):
                 raise WBAccessError(
-                    f"Wildberries ограничил публичный запрос (HTTP {response.status_code}). "
-                    "Парсер остановлен без обхода ограничения; попробуйте позже."
+                    f"WB вернул HTTP {response.status_code}: доступ к внутреннему каталогу ограничен. "
+                    "Проверка цен не выполнена. Повторные запросы не помогут, пока WB не предоставит доступ к этому источнику."
                 )
             if response.status_code != 200:
                 raise WBAccessError(f"Wildberries вернул HTTP {response.status_code}.")
