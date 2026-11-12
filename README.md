@@ -8,7 +8,7 @@ Windows desktop app for collecting storefront prices from OZON and WB.
 - Enter a seller page and a delivery location.
 - Save results as `OZON_JKeratin_YYYY-MM-DD_HH-MM.xlsx` or `WB_JKeratin_YYYY-MM-DD_HH-MM.xlsx` in `exports`. The store label can be edited in the interface. Repeated exports in the same minute receive `_2`, `_3`, etc.
 - Google Sheets upload is optional and disabled by default so the first checks run locally.
-- WB currently uses an internal catalog endpoint without cookies or login; **HTTP 403 has been observed locally**. This endpoint cannot be considered working until another supported/publicly accessible source is verified. The app stops and explains the restriction.
+- WB (experimental): the app opens its own temporary Chrome session on the public seller page, reads only WB cookies from that session into memory and attempts the internal catalog request once. The temporary browser is closed; its cookies are not saved to the repository, files, logs, or another service. This approach is **not yet verified to work**; HTTP 403 may persist even with cookies, in which case the parser stops with a clear error.
 
 For WB, pick Moscow, Saint Petersburg, Kazan or Syktyvkar from the dropdown, or type a numeric `dest` value. Default is the JKeratin seller and Moscow (`-1257786`). This selects a region, not a specific pickup point. A true PVZ-level selection needs a separate validation against WB's location flow and should not be inferred from the `dest` code.
 
@@ -25,7 +25,14 @@ Each colleague needs their own Windows account/profile and local virtual environ
 
 ## OZON browser
 
-The OZON parser opens a visible Chrome window by default, as in the original working version. No command-line environment variable is needed to display it. The GUI shows brief progress statuses without per-stage timings. If OZON displays an access restriction at PVZ selection, the parser stops rather than pretending that prices have been collected.
+The OZON parser opens a visible Chrome window by default, as in the original working version. The `Компактное окно Chrome (OZON)` checkbox is selected by default: the browser is positioned in the right-hand side of the desktop at a smaller size. Uncheck it to use the original 1920x1080 window. No command-line environment variable is needed. The GUI shows brief progress statuses without per-stage timings. If OZON displays an access restriction at PVZ selection, the parser stops rather than pretending that prices have been collected.
+
+## WB browser-session test
+
+- WB uses its **own** Selenium-launched browser, not cookies from your personal Chrome profile. Do not log into a personal WB account for this test.
+- Close the browser normally after the site loads; its session cookies are used only in process memory to request the catalog.
+- The test proves whether this particular endpoint accepts a fresh browser session. It does not confirm PVZ-level selection: `dest` remains a region code.
+- If WB returns HTTP 403, stop and revisit the acquisition approach. Do not paste authentication cookies or tokens into support chats or GitHub issues.
 
 ## Google Sheets
 
