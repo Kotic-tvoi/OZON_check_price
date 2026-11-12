@@ -85,8 +85,7 @@ def create_driver():
     from selenium.webdriver.chrome.options import Options
     options = Options()
     options.add_argument(f'--window-size={CHROME_WINDOW_SIZE}')
-    if os.getenv('OZON_SHOW_CHROME', '').lower() not in ('1', 'true', 'yes'):
-        options.add_argument('--headless=new')
+    # Keep the Chrome window visible, matching the previously working OZON flow.
     options.add_argument('--disable-blink-features=AutomationControlled')
     options.add_argument('--no-proxy-server')
     options.add_argument('--disable-extensions')
@@ -242,19 +241,14 @@ def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *,
     for attempt in range(max_attempts):
         driver = None
         try:
-            phase = time.monotonic()
-            notify("Запуск Chrome...")
+            notify("Запускаем Chrome...")
             driver = create_driver()
-            notify(f"Chrome готов за {time.monotonic()-phase:.1f} с")
-            phase = time.monotonic()
-            notify("Выбор ПВЗ...")
+            notify("Выбираем ПВЗ...")
             address = set_pvz(driver, pvz)
-            notify(f"ПВЗ выбран за {time.monotonic()-phase:.1f} с: {address}")
-            phase = time.monotonic()
-            notify("Открытие магазина OZON...")
+            notify("Открываем каталог OZON...")
             driver.get(store)
             _wait_store(driver, address)
-            notify(f"Каталог OZON загружен за {time.monotonic()-phase:.1f} с")
+            notify("Собираем цены OZON...")
             collected: dict[str, dict] = {}
             idle = 0
             for step in range(max_scrolls):
