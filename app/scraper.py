@@ -6,6 +6,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 from config import (DEFAULT_PVZ, DEFAULT_STORE, LOAD_TIMEOUT, IDLE_LIMIT,
                     MAX_SCROLLS, CAPTCHA_MAX_ATTEMPTS, SCROLL_POLL_INTERVAL,
@@ -84,6 +85,8 @@ def create_driver():
     from selenium.webdriver.chrome.options import Options
     options = Options()
     options.add_argument(f'--window-size={CHROME_WINDOW_SIZE}')
+    if os.getenv('OZON_SHOW_CHROME', '').lower() not in ('1', 'true', 'yes'):
+        options.add_argument('--headless=new')
     options.add_argument('--disable-blink-features=AutomationControlled')
     options.add_argument('--no-proxy-server')
     options.add_argument('--disable-extensions')
@@ -224,19 +227,34 @@ def _snapshot(driver) -> dict:
 
 def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *,
             load_timeout: float = LOAD_TIMEOUT, idle_limit: int = IDLE_LIMIT,
-            max_scrolls: int = MAX_SCROLLS, max_attempts: int = CAPTCHA_MAX_ATTEMPTS) -> Catalog:
+            max_scrolls: int = MAX_SCROLLS, max_attempts: int = CAPTCHA_MAX_ATTEMPTS,
+            progress: Callable[[str], None] | None = None) -> Catalog:
     """Read all visible/lazy-loaded catalog tiles in one Chrome, no database."""
     store, pvz = store_url(store), pvz_url(pvz)
     if load_timeout <= 0 or idle_limit < 1 or max_scrolls < 1 or max_attempts < 1:
         raise ValueError('Параметры ожидания, прокрутки и попыток должны быть положительными')
     start = time.monotonic()
+    def notify(message: str):
+        if progress is not None:
+            progress(message)
+        LOG.info(message)
+
     for attempt in range(max_attempts):
         driver = None
         try:
+            phase = time.monotonic()
+            notify("Запуск Chrome...")
             driver = create_driver()
+            notify(f"Chrome готов за {time.monotonic()-phase:.1f} с")
+            phase = time.monotonic()
+            notify("Выбор ПВЗ...")
             address = set_pvz(driver, pvz)
+            notify(f"ПВЗ выбран за {time.monotonic()-phase:.1f} с: {address}")
+            phase = time.monotonic()
+            notify("Открытие магазина OZON...")
             driver.get(store)
             _wait_store(driver, address)
+            notify(f"Каталог OZON загружен за {time.monotonic()-phase:.1f} с")
             collected: dict[str, dict] = {}
             idle = 0
             for step in range(max_scrolls):
@@ -264,6 +282,7 @@ def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *,
                     fresh = _snapshot(driver)
                     if fresh['ready'] and tuple(x['article'] for x in fresh['items']) != signature:
                         break
+            notify(f"Сбор каталога завершён: {len(collected)} товаров")
             if not collected:
                 raise CatalogError('В каталоге не найдены товары с артикулами')
             return Catalog(store, pvz, address, sorted(collected.values(),key=lambda x:int(x['article'])),
@@ -271,7 +290,7 @@ def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *,
         except AccessError:
             if attempt + 1 >= max_attempts:
                 raise
-            LOG.warning('Проверка доступа Ozon: повторный запуск Chrome (%d/%d)',attempt+2,max_attempts)
+            notify(f'OZON ограничил доступ. Повторная попытка {attempt+2}/{max_attempts}')
         finally:
             if driver is not None:
                 driver.quit()
