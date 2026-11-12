@@ -171,7 +171,7 @@ def set_pvz(driver, url: str) -> str:
         address, button = WebDriverWait(driver, PVZ_READY_TIMEOUT, poll_frequency=PVZ_POLL_INTERVAL).until(ready)
     except TimeoutException as exc:
         if is_blocked(driver):
-            raise AccessError('Ozon показывает страницу ограничения при выборе ПВЗ') from exc
+            raise AccessError('OZON показывает страницу ограничения при выборе ПВЗ') from exc
         raise CatalogError('Не удалось найти адрес и кнопку выбора ПВЗ') from exc
 
     def applied(d):
@@ -192,7 +192,7 @@ def set_pvz(driver, url: str) -> str:
             return address
         except (TimeoutException, StaleElementReferenceException):
             if is_blocked(driver):
-                raise AccessError('Ozon требует CAPTCHA при выборе ПВЗ')
+                raise AccessError('OZON требует CAPTCHA при выборе ПВЗ')
             try:
                 address, button = WebDriverWait(driver, PVZ_RETRY_TIMEOUT, poll_frequency=PVZ_POLL_INTERVAL).until(ready)
             except TimeoutException:
@@ -216,7 +216,7 @@ def _wait_store(driver, address: str, timeout: float = STORE_READY_TIMEOUT):
         WebDriverWait(driver, timeout, poll_frequency=STORE_POLL_INTERVAL).until(ready)
     except TimeoutException as exc:
         if is_blocked(driver):
-            raise AccessError('Ozon показывает страницу ограничения при открытии магазина') from exc
+            raise AccessError('OZON показывает страницу ограничения при открытии магазина') from exc
         raise CatalogError('Не подтверждён ПВЗ или отсутствует каталог магазина') from exc
 
 
