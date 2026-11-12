@@ -127,6 +127,10 @@ def prepare_browser_session(session: requests.Session, store: str,
                 "return document.readyState === 'complete' || document.readyState === 'interactive'"
             )
         )
+        # Keep Chrome visible long enough to inspect any warning or access page.
+        if progress:
+            progress("Окно WB останется открытым 15 секунд для проверки страницы...")
+        time.sleep(15)
         cookies = driver.get_cookies()
         count = 0
         for cookie in cookies:
