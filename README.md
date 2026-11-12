@@ -30,7 +30,7 @@ The OZON parser opens a visible Chrome window by default, as in the original wor
 ## WB browser-session test
 
 - WB uses its **own** Selenium-launched browser, not cookies from your personal Chrome profile. Do not log into a personal WB account for this test.
-- Close the browser normally after the site loads; its session cookies are used only in process memory to request the catalog.
+- The application closes that browser automatically after collecting session cookies. They are used only in process memory to request the catalog.
 - The test proves whether this particular endpoint accepts a fresh browser session. It does not confirm PVZ-level selection: `dest` remains a region code.
 - If WB returns HTTP 403, stop and revisit the acquisition approach. Do not paste authentication cookies or tokens into support chats or GitHub issues.
 
