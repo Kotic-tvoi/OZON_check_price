@@ -274,7 +274,7 @@ class PricesApp:
         try:
             if marketplace == "OZON":
                 from scraper import collect
-                self.events.put(("status", "Запускаем Chrome для OZON в фоновом режиме..."))
+                self.events.put(("status", "Открываем Chrome для OZON..."))
                 def report(message):
                     self.events.put(("status", message))
                     self.events.put(("log", "[OZON] " + message))
@@ -283,8 +283,7 @@ class PricesApp:
                 from wb_scraper import collect
                 self.events.put(("status", "Проверяем открытый каталог WB без авторизации..."))
                 catalog = collect(store, region)
-            self.events.put(("log", f"Найдено товаров: {len(catalog.items)}; "
-                                    f"время: {catalog.elapsed_seconds} с."))
+            self.events.put(("log", f"Найдено товаров: {len(catalog.items)}"))
             if include_excel:
                 path = export_excel(catalog.items, marketplace, shop_name)
                 self.events.put(("log", f"Excel сохранён: {path}"))
