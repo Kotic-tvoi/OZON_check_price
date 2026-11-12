@@ -23,7 +23,7 @@ def export_excel(items: list[dict], marketplace: str) -> Path:
     base = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
     destination = base / "exports"
     destination.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
     path = destination / f"{marketplace.lower()}_{stamp}.xlsx"
     path.write_bytes(to_xlsx(items))
     return path
