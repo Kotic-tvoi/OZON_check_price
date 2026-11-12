@@ -23,9 +23,9 @@ This test branch creates a **separate test virtual environment** at `%LOCALAPPDA
 
 Each colleague needs their own Windows account/profile and local virtual environment. Do not run two copies of setup that share the same environment. On a network drive, use a folder with stable availability and individual write permissions; simultaneous runs are supported by separate environments, but files should not be edited or replaced while another user is running the app.
 
-## OZON browser and startup timings
+## OZON browser
 
-By default Chrome runs in headless mode (without a visible window). For debugging, in Git Bash execute `export OZON_SHOW_CHROME=1` before invoking the launcher, or in Windows CMD execute `set OZON_SHOW_CHROME=1`. The GUI reports how long Chrome startup, PVZ selection, and catalog loading take. This allows distinguishing driver setup from network/page delays. If headless mode triggers access challenges, switch to visible Chrome temporarily and report the difference.
+The OZON parser opens a visible Chrome window by default, as in the original working version. No command-line environment variable is needed to display it. The GUI shows brief progress statuses without per-stage timings. If OZON displays an access restriction at PVZ selection, the parser stops rather than pretending that prices have been collected.
 
 ## Google Sheets
 
