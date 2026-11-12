@@ -71,6 +71,7 @@ class PricesApp:
         self.shop_name = tk.StringVar(value="JKeratin")
         self._auto_store_name = "JKeratin"
         self.save_excel = tk.BooleanVar(value=True)
+        self.compact_chrome = tk.BooleanVar(value=True)
         # Local-first mode: Google upload is deliberately opt-in.
         self.upload_google = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Готово к проверке")
@@ -129,6 +130,10 @@ class PricesApp:
         self.shop_entry.pack(fill="x", pady=(5, 10))
         self._bind_editing(self.shop_entry)
 
+        self.compact_check = ttk.Checkbutton(
+            panel, text="Компактное окно Chrome (OZON)",
+            variable=self.compact_chrome)
+        self.compact_check.pack(anchor="w", pady=(0, 4))
         ttk.Checkbutton(panel, text="Сохранить Excel в папку exports",
                         variable=self.save_excel).pack(anchor="w", pady=(2, 3))
         self.google_check = ttk.Checkbutton(
@@ -150,7 +155,7 @@ class PricesApp:
                                              fg="#27384B", padx=10, pady=9)
         self.log.pack(fill="both", expand=True, pady=(6, 0))
         self.write_log("Выберите маркетплейс и проверьте ссылку магазина и регион.")
-        self.write_log("WB: публичный каталог может отвечать HTTP 403; доступ пока не подтверждён.")
+        self.write_log("WB: тестовый режим с отдельным Chrome; получение цен пока не подтверждено.")
         root.after(120, self.consume_events)
 
     def _bind_editing(self, entry):
@@ -169,6 +174,7 @@ class PricesApp:
             self.region_label.configure(text="Город доставки WB")
             self.region_note.configure(
                 text="Выберите город из списка или введите числовой код dest. Это регион, не конкретный ПВЗ.")
+            self.compact_check.configure(state="disabled")
             self.google_check.configure(state="disabled")
             self.upload_google.set(False)
         else:
@@ -178,6 +184,7 @@ class PricesApp:
             self.store_label.configure(text="Ссылка на магазин OZON")
             self.region_label.configure(text="Ссылка на пункт выдачи (ПВЗ) OZON")
             self.region_note.configure(text="Для OZON укажите ссылку на ПВЗ.")
+            self.compact_check.configure(state="normal")
             self.google_check.configure(state="normal")
         self.shop_name.set("JKeratin")
         self._auto_store_name = "JKeratin"
@@ -265,12 +272,12 @@ class PricesApp:
         thread = threading.Thread(
             target=self.collect_prices,
             args=(marketplace, store, region, bool(self.save_excel.get()),
-                  bool(self.upload_google.get()), shop_name),
+                  bool(self.upload_google.get()), shop_name, bool(self.compact_chrome.get())),
             daemon=True,
         )
         thread.start()
 
-    def collect_prices(self, marketplace, store, region, include_excel, include_google, shop_name):
+    def collect_prices(self, marketplace, store, region, include_excel, include_google, shop_name, compact_chrome):
         try:
             if marketplace == "OZON":
                 from scraper import collect
@@ -278,11 +285,14 @@ class PricesApp:
                 def report(message):
                     self.events.put(("status", message))
                     self.events.put(("log", "[OZON] " + message))
-                catalog = collect(store, region, progress=report)
+                catalog = collect(store, region, progress=report, compact_window=compact_chrome)
             else:
                 from wb_scraper import collect
-                self.events.put(("status", "Проверяем открытый каталог WB без авторизации..."))
-                catalog = collect(store, region)
+                def report_wb(message):
+                    self.events.put(("status", message))
+                    self.events.put(("log", "[WB] " + message))
+                self.events.put(("status", "Открываем магазин WB в отдельном Chrome..."))
+                catalog = collect(store, region, progress=report_wb)
             self.events.put(("log", f"Найдено товаров: {len(catalog.items)}"))
             if include_excel:
                 path = export_excel(catalog.items, marketplace, shop_name)
