@@ -5,8 +5,7 @@ from zipfile import ZipFile, ZIP_DEFLATED
 
 
 def to_xlsx(rows: list[dict], sheet_name: str = "Цены") -> bytes:
-    import re
-    safe_name = re.sub(r'[\\[\\]:*?/\\\\]', "_", sheet_name).strip("'")[:31] or "Цены"
+    safe_name = "".join("_" if ch in '[]:*?/\\' else ch for ch in sheet_name).strip("'")[:31] or "Цены"
     def cell(ref, value):
         if value is None:
             return ''
