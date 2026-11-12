@@ -7,7 +7,7 @@ if not defined LOCALAPPDATA (
     echo Windows user profile is unavailable.
     goto failed
 )
-set "APP_ENV=%LOCALAPPDATA%\JKeratinPriceParser\.venv"
+set "APP_ENV=%LOCALAPPDATA%\JKeratinPriceParser-Test\.venv"
 if not exist "%APP_ENV%\Scripts\python.exe" (
     echo Creating a private Python environment for this Windows user...
     py -3 -m venv "%APP_ENV%"
