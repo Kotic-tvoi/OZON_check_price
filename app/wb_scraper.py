@@ -131,6 +131,20 @@ def prepare_browser_session(session: requests.Session, store: str,
         if progress:
             progress("Окно WB останется открытым 15 секунд для проверки страницы...")
         time.sleep(15)
+        # Detect a challenge page before attempting to reuse its cookies.
+        # This is a fail-closed check, not an attempt to bypass the restriction.
+        page_text = (driver.execute_script(
+            "return (document.body && document.body.innerText || '').slice(0,6000)"
+        ) or "").casefold()
+        if ("подозрительная активность" in page_text
+                or ("что-то не так" in page_text and "пожалуйста, подождите" in page_text)
+                or "новая попытка через" in page_text):
+            raise WBAccessError(
+                "WB показывает защитную страницу «Подозрительная активность» ещё "
+                "при открытии магазина в Chrome. Сбор цен остановлен; cookies "
+                "этой страницы не используются. Проверьте доступ к магазину "
+                "в обычном браузере и при необходимости обратитесь в поддержку WB."
+            )
         cookies = driver.get_cookies()
         count = 0
         for cookie in cookies:
@@ -145,6 +159,8 @@ def prepare_browser_session(session: requests.Session, store: str,
         if progress:
             progress("Браузерная сессия WB подготовлена. Проверяем доступ к каталогу...")
         LOG.info("WB browser session initialized with %d site cookies (values not logged)", count)
+    except WBAccessError:
+        raise
     except Exception as exc:
         raise WBAccessError(
             "Не удалось открыть магазин WB в Chrome. Проверьте доступность сайта в браузере."
