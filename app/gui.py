@@ -71,6 +71,8 @@ class PricesApp:
         self.shop_name = tk.StringVar(value="JKeratin")
         self._auto_store_name = "JKeratin"
         self.save_excel = tk.BooleanVar(value=True)
+        self.wb_manual_login = tk.BooleanVar(value=False)
+        self.wb_login_event = None
         # Local-first mode: Google upload is deliberately opt-in.
         self.upload_google = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Готово к проверке")
@@ -129,6 +131,11 @@ class PricesApp:
         self.shop_entry.pack(fill="x", pady=(5, 10))
         self._bind_editing(self.shop_entry)
 
+        self.wb_login_check = ttk.Checkbutton(
+            panel, text="Ручной вход в WB (при необходимости)",
+            variable=self.wb_manual_login)
+        self.wb_login_check.pack(anchor="w", pady=(1, 4))
+        self.wb_login_check.configure(state="disabled")
         ttk.Checkbutton(panel, text="Сохранить Excel в папку exports",
                         variable=self.save_excel).pack(anchor="w", pady=(2, 3))
         self.google_check = ttk.Checkbutton(
@@ -141,6 +148,9 @@ class PricesApp:
         self.start_button = ttk.Button(actions, text="Проверить цены",
                                        style="Run.TButton", command=self.start)
         self.start_button.pack(side="left")
+        self.continue_login_button = ttk.Button(
+            actions, text="Готово — продолжить", command=self.confirm_wb_login)
+        # Show this only while the WB browser is waiting for the user's action.
         ttk.Label(actions, textvariable=self.status, style="Main.TLabel",
                   wraplength=390).pack(side="left", padx=(18, 0))
         ttk.Label(panel, text="Ход проверки", style="Main.TLabel").pack(anchor="w")
@@ -169,6 +179,7 @@ class PricesApp:
             self.region_label.configure(text="Город доставки WB")
             self.region_note.configure(
                 text="Выберите город из списка или введите числовой код dest. Это регион, не конкретный ПВЗ.")
+            self.wb_login_check.configure(state="normal")
             self.google_check.configure(state="disabled")
             self.upload_google.set(False)
         else:
@@ -178,6 +189,8 @@ class PricesApp:
             self.store_label.configure(text="Ссылка на магазин OZON")
             self.region_label.configure(text="Ссылка на пункт выдачи (ПВЗ) OZON")
             self.region_note.configure(text="Для OZON укажите ссылку на ПВЗ.")
+            self.wb_login_check.configure(state="disabled")
+            self.wb_manual_login.set(False)
             self.google_check.configure(state="normal")
         self.shop_name.set("JKeratin")
         self._auto_store_name = "JKeratin"
@@ -234,6 +247,18 @@ class PricesApp:
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    def confirm_wb_login(self):
+        if self.wb_login_event is not None:
+            self.wb_login_event.set()
+            self.continue_login_button.pack_forget()
+
+    def wait_for_wb_login(self):
+        confirmation = threading.Event()
+        self.events.put(("login_wait", confirmation))
+        completed = confirmation.wait(timeout=180)
+        self.events.put(("login_end", None))
+        return completed
+
     def start(self):
         if self.busy:
             return
@@ -256,6 +281,7 @@ class PricesApp:
             messagebox.showerror("Проверьте данные", str(exc))
             return
         self.busy = True
+        self.wb_login_check.configure(state="disabled")
         self.start_button.configure(state="disabled")
         self.status.set("Подготовка...")
         self.write_log(f"Маркетплейс: {marketplace}")
@@ -265,12 +291,12 @@ class PricesApp:
         thread = threading.Thread(
             target=self.collect_prices,
             args=(marketplace, store, region, bool(self.save_excel.get()),
-                  bool(self.upload_google.get()), shop_name),
+                  bool(self.upload_google.get()), shop_name, bool(self.wb_manual_login.get())),
             daemon=True,
         )
         thread.start()
 
-    def collect_prices(self, marketplace, store, region, include_excel, include_google, shop_name):
+    def collect_prices(self, marketplace, store, region, include_excel, include_google, shop_name, manual_login):
         try:
             if marketplace == "OZON":
                 from scraper import collect
@@ -285,7 +311,11 @@ class PricesApp:
                     self.events.put(("status", message))
                     self.events.put(("log", "[WB] " + message))
                 self.events.put(("status", "Открываем магазин WB в отдельном Chrome..."))
-                catalog = collect(store, region, progress=report_wb)
+                catalog = collect(
+                    store, region, progress=report_wb,
+                    manual_login=manual_login,
+                    wait_for_login=self.wait_for_wb_login if manual_login else None
+                )
             self.events.put(("log", f"Найдено товаров: {len(catalog.items)}"))
             if include_excel:
                 path = export_excel(catalog.items, marketplace, shop_name)
@@ -306,18 +336,31 @@ class PricesApp:
         try:
             while True:
                 kind, data = self.events.get_nowait()
-                if kind == "log":
+                if kind == "login_wait":
+                    self.wb_login_event = data
+                    self.continue_login_button.pack(side="left", padx=(8, 0))
+                    self.status.set("Войдите в WB вручную и нажмите «Готово — продолжить»")
+                elif kind == "login_end":
+                    self.wb_login_event = None
+                    self.continue_login_button.pack_forget()
+                elif kind == "log":
                     self.write_log(data)
                 elif kind == "status":
                     self.status.set(data)
                 elif kind == "done":
                     self.busy = False
+                    self.wb_login_event = None
+                    self.continue_login_button.pack_forget()
+                    self.wb_login_check.configure(state="normal" if self.market.get() == "WB" else "disabled")
                     self.start_button.configure(state="normal")
                     self.status.set(data)
                     self.write_log(data)
                     messagebox.showinfo("Проверка завершена", data)
                 elif kind == "error":
                     self.busy = False
+                    self.wb_login_event = None
+                    self.continue_login_button.pack_forget()
+                    self.wb_login_check.configure(state="normal" if self.market.get() == "WB" else "disabled")
                     self.start_button.configure(state="normal")
                     self.status.set("Ошибка")
                     self.write_log("Ошибка: " + data)
