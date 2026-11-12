@@ -80,12 +80,45 @@ class Catalog:
         }
 
 
-def create_driver():
+def compact_chrome_geometry() -> tuple[int, int, int, int]:
+    """Position a modest-sized visible Chrome in the right-hand screen corner."""
+    if os.name != "nt":
+        return 1100, 760, 20, 20
+    try:
+        import ctypes
+
+        class Rect(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        work = Rect()
+        ok = ctypes.windll.user32.SystemParametersInfoW(
+            0x0030, 0, ctypes.byref(work), 0
+        )
+        if not ok or work.right <= work.left or work.bottom <= work.top:
+            raise OSError("Cannot read Windows work area")
+        available_width = work.right - work.left
+        available_height = work.bottom - work.top
+        width = min(1100, max(600, available_width - 24))
+        height = min(760, max(480, available_height - 24))
+        x = max(work.left, work.right - width - 8)
+        y = max(work.top, work.bottom - height - 8)
+        return width, height, x, y
+    except (OSError, AttributeError):
+        return 1100, 760, 20, 20
+
+
+def create_driver(*, compact_window: bool = True):
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     options = Options()
-    options.add_argument(f'--window-size={CHROME_WINDOW_SIZE}')
-    # Keep the Chrome window visible, matching the previously working OZON flow.
+    if compact_window:
+        width, height, x, y = compact_chrome_geometry()
+        options.add_argument(f'--window-size={width},{height}')
+        options.add_argument(f'--window-position={x},{y}')
+    else:
+        options.add_argument(f'--window-size={CHROME_WINDOW_SIZE}')
+    # Keep Chrome visible; headless mode caused access problems on the test machine.
     options.add_argument('--disable-blink-features=AutomationControlled')
     options.add_argument('--no-proxy-server')
     options.add_argument('--disable-extensions')
@@ -227,7 +260,8 @@ def _snapshot(driver) -> dict:
 def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *,
             load_timeout: float = LOAD_TIMEOUT, idle_limit: int = IDLE_LIMIT,
             max_scrolls: int = MAX_SCROLLS, max_attempts: int = CAPTCHA_MAX_ATTEMPTS,
-            progress: Callable[[str], None] | None = None) -> Catalog:
+            progress: Callable[[str], None] | None = None,
+            compact_window: bool = True) -> Catalog:
     """Read all visible/lazy-loaded catalog tiles in one Chrome, no database."""
     store, pvz = store_url(store), pvz_url(pvz)
     if load_timeout <= 0 or idle_limit < 1 or max_scrolls < 1 or max_attempts < 1:
@@ -242,7 +276,7 @@ def collect(store: str = DEFAULT_STORE, pvz: str = DEFAULT_PVZ, *,
         driver = None
         try:
             notify("Запускаем Chrome...")
-            driver = create_driver()
+            driver = create_driver(compact_window=compact_window)
             notify("Выбираем ПВЗ...")
             address = set_pvz(driver, pvz)
             notify("Открываем каталог OZON...")
