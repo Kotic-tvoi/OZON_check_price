@@ -6,7 +6,7 @@ Windows desktop app for collecting storefront prices from OZON and WB.
 
 - Select OZON or WB in the app.
 - Enter a seller page and a delivery location.
-- Save results as `OZON_JKeratin_YYYY-MM-DD_HH-MM.xlsx` or `WB_JKeratin_YYYY-MM-DD_HH-MM.xlsx` in `exports`. The store label can be edited in the interface. Repeated exports in the same minute receive `_2`, `_3`, etc.
+- Save results as `OZON_JKeratin_DD-MM-YYYY_HH-MM.xlsx` or `WB_JKeratin_DD-MM-YYYY_HH-MM.xlsx` in `exports`. The store label can be edited in the interface. Repeated exports in the same minute receive `_2`, `_3`, etc.
 - Google Sheets upload is optional and disabled by default so the first checks run locally.
 - WB (experimental): the app opens its own temporary Chrome session on the public seller page, reads only WB cookies from that session into memory and attempts the internal catalog request once. The temporary browser is closed; its cookies are not saved to the repository, files, logs, or another service. This approach is **not yet verified to work**; HTTP 403 may persist even with cookies, in which case the parser stops with a clear error.
 
@@ -25,12 +25,12 @@ Each colleague needs their own Windows account/profile and local virtual environ
 
 ## OZON browser
 
-The OZON parser opens a visible Chrome window by default, as in the original working version. The `Компактное окно Chrome (OZON)` checkbox is selected by default: the browser is positioned in the right-hand side of the desktop at a smaller size. Uncheck it to use the original 1920x1080 window. No command-line environment variable is needed. The GUI shows brief progress statuses without per-stage timings. If OZON displays an access restriction at PVZ selection, the parser stops rather than pretending that prices have been collected.
+The OZON parser always opens a smaller visible Chrome window positioned on the right-hand side of the desktop. There is no compact-mode checkbox or command-line flag. The GUI shows brief progress statuses without per-stage timings. If OZON displays an access restriction at PVZ selection, the parser stops rather than pretending that prices have been collected.
 
 ## WB browser-session test
 
 - WB uses its **own** Selenium-launched browser, not cookies from your personal Chrome profile. Do not log into a personal WB account for this test.
-- The application closes that browser automatically after collecting session cookies. They are used only in process memory to request the catalog.
+- The application keeps the WB Chrome window open for 15 seconds after the page loads, so you can inspect any message, and then closes it automatically after collecting session cookies. Cookies are used only in process memory to request the catalog.
 - The test proves whether this particular endpoint accepts a fresh browser session. It does not confirm PVZ-level selection: `dest` remains a region code.
 - If WB returns HTTP 403, stop and revisit the acquisition approach. Do not paste authentication cookies or tokens into support chats or GitHub issues.
 
