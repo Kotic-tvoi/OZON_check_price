@@ -78,3 +78,14 @@ Run the checklist on a clean Windows 10/11 workstation before sharing a release.
 - [ ] Add WB upload only after local WB collection and Excel results are accepted.
 - [ ] If exact WB pickup-point comparison is required, investigate a supported/observable PVZ selection flow separately; do not treat city-level `dest` as a PVZ.
 - [ ] Create a clean release package and test it from a new folder/profile before distribution.
+
+
+## 9. Findings in the existing WB server repository
+
+The reviewed `Kotic-tvoi/django-api` repository is public. Its current source includes a literal Django `SECRET_KEY` in `myproject/myproject/settings.py`, has `DEBUG` defaulting to true, and commits `myproject/state.json` with cookies for `wbs.e-teleport.ru`. No credential values are reproduced here.
+
+- [ ] Treat the committed Django secret as compromised: replace it with a new environment-provided value and verify the deployed service reads the new value.
+- [ ] Disable debug mode explicitly in production and review host/security settings for the current deployment.
+- [ ] Revoke/rotate the committed external-service cookies or sessions; verify whether they still grant access.
+- [ ] Remove sensitive files from the current tree and, after rotation, clean the Git history so old values are not retrievable from prior commits.
+- [ ] Review access logs, repository collaborators, server logs, and deployment environment for any other copied credentials.
