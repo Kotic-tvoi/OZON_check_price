@@ -15,16 +15,12 @@ import urllib.request
 import json
 from pathlib import Path
 
-
-
 class WBBrowserError(RuntimeError):
     pass
-
 
 def profile_path() -> Path:
     root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
     return root / "JKeratinPriceParser-Test" / "WB-Chrome-Profile"
-
 
 def _find_chrome() -> str:
     candidates = [
@@ -32,20 +28,16 @@ def _find_chrome() -> str:
         os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
         os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
         os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-        os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
-        os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
     ]
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
             return candidate
     raise WBBrowserError("Не найден Google Chrome. Установите Chrome и повторите попытку.")
 
-
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
-
 
 class WBBrowserSession:
     def __init__(self, store_url: str, progress=None):
