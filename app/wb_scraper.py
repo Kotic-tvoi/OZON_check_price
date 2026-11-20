@@ -14,7 +14,8 @@ from urllib.parse import urlparse
 
 import requests
 
-from wb_cookie_store import load_cookie_cache, save_cookie_cache, active_cookie_records
+from wb_cookie_store import (load_cookie_cache, save_cookie_cache,
+                              active_cookie_records, CookieCacheError)
 from wb_browser import WBBrowserSession, WBBrowserError
 
 LOG = logging.getLogger("wb.catalog")
@@ -159,7 +160,7 @@ def refresh_browser_session(session: requests.Session, store: str,
                 progress(f"Cookies WB обновлены и сохранены в защищённом профиле Windows ({count} шт.).")
     except WBAccessError:
         raise
-    except WBBrowserError as exc:
+    except (WBBrowserError, CookieCacheError) as exc:
         raise WBAccessError(str(exc)) from exc
     except Exception as exc:
         raise WBAccessError(
