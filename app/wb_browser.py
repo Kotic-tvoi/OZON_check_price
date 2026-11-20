@@ -99,6 +99,12 @@ class WBBrowserSession:
             options.add_experimental_option("debuggerAddress", self.debugger_address)
             self.driver = webdriver.Chrome(options=options)
             self.driver.set_page_load_timeout(30)
+            from selenium.webdriver.support.ui import WebDriverWait
+            WebDriverWait(self.driver, 25, poll_frequency=0.25).until(
+                lambda browser: browser.execute_script(
+                    "return document.readyState === 'complete' || document.readyState === 'interactive'"
+                ) and browser.execute_script("return !!document.body")
+            )
             if self.progress:
                 self.progress("Chrome запущен с постоянным профилем WB через CDP.")
             return self
