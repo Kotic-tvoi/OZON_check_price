@@ -7,7 +7,6 @@ stops with a clear error when Wildberries denies or rate-limits access.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import time
 from dataclasses import dataclass
@@ -16,8 +15,8 @@ from urllib.parse import urlparse
 
 import requests
 
-from config import PAGE_LOAD_TIMEOUT
-from scraper import compact_chrome_geometry
+from wb_cookie_store import load_cookie_cache, save_cookie_cache, active_cookie_records
+from wb_browser import WBBrowserSession, WBBrowserError
 
 LOG = logging.getLogger("wb.catalog")
 CATALOG_URL = "https://www.wildberries.ru/__internal/catalog/sellers/v4/catalog"
@@ -104,106 +103,73 @@ def _read_products(payload: dict) -> list[dict]:
     return rows
 
 
-def prepare_browser_session(session: requests.Session, store: str,
+def _apply_cookies(session: requests.Session, cookies: list[dict]) -> int:
+    count = 0
+    for cookie in active_cookie_records(cookies):
+        session.cookies.set(
+            cookie["name"], cookie["value"],
+            domain=cookie.get("domain") or ".wildberries.ru",
+            path=cookie.get("path") or "/",
+        )
+        count += 1
+    return count
+
+
+def refresh_browser_session(session: requests.Session, store: str,
                             progress: Callable[[str], None] | None = None,
                             manual_login: bool = False,
                             wait_for_login: Callable[[], bool] | None = None) -> None:
-    """Open a disposable Chrome profile and reuse only WB session cookies in memory.
-
-    No existing Windows/Chrome browser profile is read or changed. This does NOT
-    guarantee the restricted internal WB endpoint will accept the API request.
-    """
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.support.ui import WebDriverWait
-
+    """Refresh WB cookies in a dedicated persistent Chrome profile via CDP."""
     if progress:
-        progress("Открываем магазин WB в Chrome...")
-    options = Options()
-    width, height, x, y = compact_chrome_geometry()
-    options.add_argument(f"--window-size={width},{height}")
-    options.add_argument(f"--window-position={x},{y}")
-    # Match the currently working OZON Chrome launch options for the comparison.
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--no-proxy-server")
-    options.add_argument("--disable-extensions")
-    options.add_experimental_option("prefs", {
-        "profile.managed_default_content_settings.images": 2,
-    })
-    options.page_load_strategy = "eager"
-    if os.getenv("OZON_CHROME_BINARY"):
-        options.binary_location = os.environ["OZON_CHROME_BINARY"]
-    driver = None
+        progress("Открываем WB в отдельном Chrome через CDP...")
     try:
-        driver = webdriver.Chrome(options=options)
-        driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
-        driver.get(store)
-        WebDriverWait(driver, 12, poll_frequency=0.3).until(
-            lambda browser: browser.execute_script(
-                "return document.readyState === 'complete' || document.readyState === 'interactive'"
-            )
-        )
-        def blocked_page() -> bool:
-            page_text = (driver.execute_script(
-                "return (document.body && document.body.innerText || '').slice(0,6000)"
-            ) or "").casefold()
-            return (
-                "подозрительная активность" in page_text
-                or ("что-то не так" in page_text and "пожалуйста, подождите" in page_text)
-                or "новая попытка через" in page_text
-            )
+        with WBBrowserSession(store, progress=progress) as browser:
+            page_text = browser.page_text()
 
-        if manual_login:
-            if blocked_page():
-                if progress:
-                    progress("WB сразу показал страницу ограничения. Окно останется открытым 15 секунд...")
-                time.sleep(15)
-            else:
-                if progress:
-                    progress("При необходимости войдите или зарегистрируйтесь в Chrome вручную, затем нажмите «Готово — продолжить» в приложении.")
-                if wait_for_login is None or not wait_for_login():
+            def is_challenge(text: str) -> bool:
+                return (
+                    "подозрительная активность" in text
+                    or ("что-то не так" in text and "пожалуйста, подождите" in text)
+                    or "новая попытка через" in text
+                )
+
+            if is_challenge(page_text):
+                if not manual_login or wait_for_login is None:
                     raise WBAccessError(
-                        "Вход в WB не был подтверждён в приложении за 3 минуты. "
-                        "Проверка остановлена, cookies не переданы."
+                        "WB показал защитную страницу «Подозрительная активность». "
+                        "Cookies не обновлены. Откройте WB позже или проверьте доступ в обычном браузере."
                     )
-                # Return to the store page in the same authorized browser session.
-                driver.get(store)
-        else:
-            if progress:
-                progress("Окно WB останется открытым 15 секунд для проверки страницы...")
-            time.sleep(15)
+                if progress:
+                    progress("WB показал проверку доступа. Если сайт предлагает штатную проверку, завершите её вручную и нажмите «Готово — продолжить».")
+                if not wait_for_login():
+                    raise WBAccessError("Ожидание ручной проверки WB завершилось по тайм-ауту.")
+                page_text = browser.page_text()
+                if is_challenge(page_text):
+                    raise WBAccessError(
+                        "Защитная страница WB осталась после ручной проверки. "
+                        "Cookies не обновлены, сбор остановлен."
+                    )
 
-        # Never reuse a protective challenge page's cookies as a successful session.
-        if blocked_page():
-            raise WBAccessError(
-                "WB показывает защитную страницу «Подозрительная активность» ещё "
-                "при открытии магазина в Chrome. Сбор цен остановлен; cookies "
-                "этой страницы не используются. Проверьте доступ к магазину "
-                "в обычном браузере и при необходимости обратитесь в поддержку WB."
-            )
-        cookies = driver.get_cookies()
-        count = 0
-        for cookie in cookies:
-            domain = str(cookie.get("domain", "")).lstrip(".").lower()
-            if domain not in ("wildberries.ru", "www.wildberries.ru") or not cookie.get("name"):
-                continue
-            session.cookies.set(
-                cookie["name"], cookie.get("value", ""),
-                domain=cookie["domain"], path=cookie.get("path") or "/"
-            )
-            count += 1
-        if progress:
-            progress("Сессия WB подготовлена. Проверяем доступ к каталогу...")
-        LOG.info("WB browser session initialized with %d site cookies (values not logged)", count)
+            cookies = browser.cookies()
+            user_agent = browser.user_agent()
+            count = len(active_cookie_records(cookies))
+            if count == 0:
+                raise WBAccessError("Chrome не получил cookies домена Wildberries.")
+            save_cookie_cache(cookies, user_agent)
+            _apply_cookies(session, cookies)
+            if user_agent:
+                session.headers["User-Agent"] = user_agent
+            if progress:
+                progress(f"Cookies WB обновлены и сохранены в защищённом профиле Windows ({count} шт.).")
     except WBAccessError:
         raise
+    except WBBrowserError as exc:
+        raise WBAccessError(str(exc)) from exc
     except Exception as exc:
         raise WBAccessError(
-            "Не удалось открыть магазин WB в Chrome. Проверьте доступность сайта в браузере."
+            "Не удалось обновить сессию WB через Chrome/CDP. "
+            "Проверьте, что Chrome или Edge установлен и не занят другим процессом."
         ) from exc
-    finally:
-        if driver:
-            driver.quit()
 
 
 def collect(store: str, destination: str = DEFAULT_DEST, *,
@@ -215,55 +181,77 @@ def collect(store: str, destination: str = DEFAULT_DEST, *,
     destination = normalize_destination(destination)
     if not 1 <= max_pages <= MAX_PAGES:
         raise ValueError(f"Число страниц должно быть от 1 до {MAX_PAGES}.")
-    seller_id = re.search(r"/seller/(\d+)/", store).group(1)
+    seller_id = re.search(r"/seller/(\\d+)/", store).group(1)
     session = requests.Session()
-    # Cookies from the temporary browser session remain in memory, never on disk.
     session.headers.update({
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7",
         "Referer": store,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/131.0.0.0 Safari/537.36",
     })
     started = time.monotonic()
     seen: dict[str, dict] = {}
+    refreshed = False
+
+    def request_page(page: int):
+        params = {
+            "ab_testing": "false", "appType": "64", "curr": "rub",
+            "dest": destination, "hide_dtype": "15",
+            "hide_vflags": "4294967296", "lang": "ru", "page": page,
+            "sort": "popular", "spp": "30", "supplier": seller_id,
+            "uclusters": "3",
+        }
+        try:
+            return session.get(CATALOG_URL, params=params, timeout=timeout)
+        except requests.RequestException as exc:
+            raise WBAccessError(
+                "Не удалось подключиться к Wildberries. Проверьте интернет и повторите попытку."
+            ) from exc
+
     try:
-        prepare_browser_session(
-            session, store, progress,
-            manual_login=manual_login, wait_for_login=wait_for_login
-        )
+        cached = load_cookie_cache()
+        if cached:
+            count = _apply_cookies(session, cached["cookies"])
+            if cached.get("user_agent"):
+                session.headers["User-Agent"] = cached["user_agent"]
+            if progress:
+                progress(f"Используем сохранённые cookies WB ({count} шт.).")
+        else:
+            if progress:
+                progress("Сохранённых cookies WB пока нет. Обновляем сессию через Chrome...")
+            refresh_browser_session(
+                session, store, progress, manual_login, wait_for_login
+            )
+            refreshed = True
+
         for page in range(1, max_pages + 1):
-            params = {
-                "ab_testing": "false",
-                "appType": "64",
-                "curr": "rub",
-                "dest": destination,
-                "hide_dtype": "15",
-                "hide_vflags": "4294967296",
-                "lang": "ru",
-                "page": page,
-                "sort": "popular",
-                "spp": "30",
-                "supplier": seller_id,
-                "uclusters": "3",
-            }
-            try:
-                response = session.get(CATALOG_URL, params=params, timeout=timeout)
-            except requests.RequestException as exc:
-                raise WBAccessError("Не удалось подключиться к Wildberries. Проверьте интернет и повторите попытку.") from exc
-            if response.status_code in (401, 403, 429):
+            response = request_page(page)
+            if response.status_code in (401, 403) and not refreshed:
+                response.close()
+                if progress:
+                    progress(f"WB вернул HTTP {response.status_code}. Обновляем cookies и повторяем запрос один раз...")
+                session.cookies.clear()
+                refresh_browser_session(
+                    session, store, progress, manual_login, wait_for_login
+                )
+                refreshed = True
+                response = request_page(page)
+            if response.status_code == 429:
                 raise WBAccessError(
-                    f"WB вернул HTTP {response.status_code} даже после открытия магазина в Chrome. "
-                    "Cookies этой сессии недостаточно для доступа к каталогу. "
-                    "Проверка остановлена; данные цен не получены."
+                    "WB вернул HTTP 429 (слишком много запросов). Повторный запрос не выполняется."
+                )
+            if response.status_code in (401, 403):
+                raise WBAccessError(
+                    f"WB повторно вернул HTTP {response.status_code} после обновления cookies. "
+                    "Возможно, действует ограничение доступа, а не истёкшая сессия."
                 )
             if response.status_code != 200:
                 raise WBAccessError(f"Wildberries вернул HTTP {response.status_code}.")
             try:
                 payload = response.json()
             except ValueError as exc:
-                raise WBCatalogError("WB вернул не JSON. Возможно, показана страница ограничения доступа.") from exc
+                raise WBCatalogError(
+                    "WB вернул не JSON. Возможно, показана страница ограничения доступа."
+                ) from exc
             if not isinstance(payload, dict):
                 raise WBCatalogError("WB вернул каталог в неизвестном формате.")
             products = _read_products(payload)
@@ -278,8 +266,7 @@ def collect(store: str, destination: str = DEFAULT_DEST, *,
         if not seen:
             raise WBCatalogError("В открытом каталоге не найдены товары с ценами.")
         return WBCatalog(
-            store_url=store,
-            destination=destination,
+            store_url=store, destination=destination,
             items=sorted(seen.values(), key=lambda row: int(row["article"])),
             elapsed_seconds=round(time.monotonic() - started, 2),
         )
