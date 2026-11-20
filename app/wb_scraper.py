@@ -133,22 +133,19 @@ def refresh_browser_session(session: requests.Session, store: str,
                     or "новая попытка через" in text
                 )
 
-            if is_challenge(page_text):
-                if not manual_login or wait_for_login is None:
-                    raise WBAccessError(
-                        "WB показал защитную страницу «Подозрительная активность». "
-                        "Cookies не обновлены. Откройте WB позже или проверьте доступ в обычном браузере."
-                    )
+            if manual_login:
+                if wait_for_login is None:
+                    raise WBAccessError("Для ручного входа не настроено подтверждение в приложении.")
                 if progress:
-                    progress("WB показал проверку доступа. Если сайт предлагает штатную проверку, завершите её вручную и нажмите «Готово — продолжить».")
+                    progress("При необходимости войдите в WB или завершите штатную проверку в Chrome, затем нажмите «Готово — продолжить».")
                 if not wait_for_login():
-                    raise WBAccessError("Ожидание ручной проверки WB завершилось по тайм-ауту.")
+                    raise WBAccessError("Ожидание ручного входа в WB завершилось по тайм-ауту.")
                 page_text = browser.page_text()
-                if is_challenge(page_text):
-                    raise WBAccessError(
-                        "Защитная страница WB осталась после ручной проверки. "
-                        "Cookies не обновлены, сбор остановлен."
-                    )
+            if is_challenge(page_text):
+                raise WBAccessError(
+                    "WB продолжает показывать защитную страницу «Подозрительная активность». "
+                    "Cookies не обновлены, сбор остановлен."
+                )
 
             cookies = browser.cookies()
             user_agent = browser.user_agent()
