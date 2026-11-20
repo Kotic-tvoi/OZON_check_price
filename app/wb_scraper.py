@@ -1,8 +1,7 @@
 """Public Wildberries seller-catalog reader for local price checks.
 
-This prototype deliberately sends no login cookies, bearer token, browser profile,
-or other account credentials. It uses the public storefront catalog endpoint and
-stops with a clear error when Wildberries denies or rate-limits access.
+Catalog parsing and pagination stay in the existing HTTP path. Browser startup is
+used only to initialize or refresh the user's dedicated WB session.
 """
 from __future__ import annotations
 
@@ -178,7 +177,7 @@ def collect(store: str, destination: str = DEFAULT_DEST, *,
     destination = normalize_destination(destination)
     if not 1 <= max_pages <= MAX_PAGES:
         raise ValueError(f"Число страниц должно быть от 1 до {MAX_PAGES}.")
-    seller_id = re.search(r"/seller/(\\d+)/", store).group(1)
+    seller_id = re.search(r"/seller/(\d+)/", store).group(1)
     session = requests.Session()
     session.headers.update({
         "Accept": "application/json, text/plain, */*",
