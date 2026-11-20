@@ -164,7 +164,7 @@ def refresh_browser_session(session: requests.Session, store: str,
     except Exception as exc:
         raise WBAccessError(
             "Не удалось обновить сессию WB через Chrome/CDP. "
-            "Проверьте, что Chrome или Edge установлен и не занят другим процессом."
+            "Проверьте, что Google Chrome установлен и не занят другим процессом."
         ) from exc
 
 
