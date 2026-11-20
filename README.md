@@ -8,7 +8,7 @@ Windows desktop app for collecting storefront prices from OZON and WB.
 - Enter a seller page and a delivery location.
 - Save results as `OZON_JKeratin_DD-MM-YYYY_HH-MM.xlsx` or `WB_JKeratin_DD-MM-YYYY_HH-MM.xlsx` in `exports`. The store label can be edited in the interface. Repeated exports in the same minute receive `_2`, `_3`, etc.
 - Google Sheets upload is optional and disabled by default so the first checks run locally.
-- WB (experimental): the app opens its own temporary Chrome session on the public seller page, using the same visible Chrome launch settings as OZON. If the WB page loads normally, it reads only WB cookies from that session into memory and requests the catalog. An optional **Ручной вход в WB** checkbox lets the user sign in or register themselves in the opened browser (no automated account creation, password capture or SMS handling) and then press **Готово — продолжить** in the app. If WB shows a protective challenge, the parser stops without reusing those cookies. A session or login does not guarantee API access; HTTP 403 may still occur.
+- WB (experimental): the existing seller-catalog HTTP parser is retained. It first loads a per-Windows-user encrypted cookie cache and requests the catalog as before. If there is no cache or the first request returns HTTP 401/403, it opens a dedicated persistent Chrome profile through the Chrome DevTools Protocol (CDP), refreshes WB cookies, stores them encrypted with Windows DPAPI under `%LOCALAPPDATA%`, and retries the same catalog request once. HTTP 429 is treated as rate limiting and does not trigger a browser refresh. The optional **Ручной вход в WB** checkbox lets the user sign in or complete a site-provided check manually in that dedicated browser and then press **Готово — продолжить**. The app does not read the user's everyday Chrome profile, collect passwords or SMS codes, or automate CAPTCHA. If WB continues to show a challenge or the retried request is denied, collection stops.
 
 For WB, pick Moscow, Saint Petersburg, Kazan or Syktyvkar from the dropdown, or type a numeric `dest` value. Default is the JKeratin seller and Moscow (`-1257786`). This selects a region, not a specific pickup point. A true PVZ-level selection needs a separate validation against WB's location flow and should not be inferred from the `dest` code.
 
@@ -27,12 +27,15 @@ Each colleague needs their own Windows account/profile and local virtual environ
 
 The OZON parser always opens a smaller visible Chrome window positioned on the right-hand side of the desktop. There is no compact-mode checkbox or command-line flag. The GUI shows brief progress statuses without per-stage timings. If OZON displays an access restriction at PVZ selection, the parser stops rather than pretending that prices have been collected.
 
-## WB browser-session test
+## WB browser and cookie lifecycle
 
-- WB uses its **own** Selenium-launched browser, not cookies from your existing Chrome profile. It matches OZON launch options (compact visible window, no proxy server, no extensions, images disabled, eager page load, and the same browser flags).
-- By default the WB Chrome window remains open for 15 seconds so you can inspect any message. Optionally, turn on **Ручной вход в WB (при необходимости)** before starting. If the store page opens without a protection warning, manually sign in or register in that browser and click **Готово — продолжить** in the application within 3 minutes. No password or phone verification code is collected by the application. The temporary browser is automatically closed after reading session cookies; they stay in memory only and are never added to the repository or logs.
-- The test proves whether this particular endpoint accepts a fresh browser session. It does not confirm PVZ-level selection: `dest` remains a region code.
-- If WB returns HTTP 403, stop and revisit the acquisition approach. Do not paste authentication cookies or tokens into support chats or GitHub issues.
+- The original catalog endpoint, destination parameters, pagination, price parsing and Excel output remain unchanged.
+- The parser first uses the encrypted cookie cache at `%LOCALAPPDATA%\\JKeratinPriceParser-Test\\wb_cookies.dpapi`. Windows DPAPI protects cookie values for the current Windows user; cookies are not written to the project folder or logs.
+- If there is no cache, or the first catalog request returns HTTP 401/403, the app launches a dedicated persistent Chrome/Edge profile at `%LOCALAPPDATA%\\JKeratinPriceParser-Test\\WB-Chrome-Profile` and attaches over CDP. It reads cookies only from that dedicated profile, refreshes the encrypted cache and retries the same API request once.
+- HTTP 429 does not trigger a refresh. A detected WB protection/challenge page stops the process. The optional **Ручной вход в WB** checkbox allows a user to sign in or complete a site-provided check manually and confirm in the app; passwords and SMS codes are not captured.
+- The dedicated browser profile persists between runs to retain the user's WB session. It is separate from the user's everyday Chrome profile. To reset the test session, close the app and remove the dedicated WB profile and encrypted cache under the current Windows user's LocalAppData.
+- A successful browser launch or cookie refresh does not guarantee the catalog endpoint will accept the request. If the single retry is still denied, the app stops with an explicit error.
+
 
 ## Google Sheets
 
