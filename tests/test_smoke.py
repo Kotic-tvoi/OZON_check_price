@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from gui import suggest_store_name
 from wb_scraper import normalize_destination, normalize_store_url, _read_products
+from wb_cookie_store import active_cookie_records
 from xlsx_export import to_xlsx
 
 
@@ -42,6 +43,15 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(result[0]["price"], 1234)
         self.assertEqual(result[0]["old_price"], 2345)
         self.assertIsNone(result[1]["price"])
+
+    def test_wb_cookie_filtering(self):
+        rows = active_cookie_records([
+            {"name": "good", "value": "secret", "domain": ".wildberries.ru", "expires": 0},
+            {"name": "expired", "value": "old", "domain": ".wildberries.ru", "expires": 99},
+            {"name": "other", "value": "x", "domain": ".example.com", "expires": 0},
+        ], now=100)
+        self.assertEqual([row["name"] for row in rows], ["good"])
+        self.assertEqual(rows[0]["value"], "secret")
 
     def test_excel_can_be_parsed(self):
         binary = to_xlsx([{"article": "1234567", "price": 1250}], sheet_name="Цены WB")
