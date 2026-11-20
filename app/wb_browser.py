@@ -15,7 +15,6 @@ import urllib.request
 import json
 from pathlib import Path
 
-from wb_cookie_store import CookieCacheError
 
 
 class WBBrowserError(RuntimeError):
