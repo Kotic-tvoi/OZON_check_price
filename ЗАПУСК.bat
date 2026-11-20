@@ -3,18 +3,23 @@ setlocal
 chcp 65001 >nul
 cd /d "%~dp0"
 set "PYTHONUTF8=1"
-if not exist ".venv\Scripts\python.exe" (
-    echo Setting up local Python environment...
-    py -3 -m venv ".venv"
+if not defined LOCALAPPDATA (
+    echo Windows user profile is unavailable.
+    goto failed
+)
+set "APP_ENV=%LOCALAPPDATA%\JKeratinPriceParser-Test\.venv"
+if not exist "%APP_ENV%\Scripts\python.exe" (
+    echo Creating a private Python environment for this Windows user...
+    py -3 -m venv "%APP_ENV%"
     if errorlevel 1 goto failed
 )
-".venv\Scripts\python.exe" -c "import selenium, google.auth" >nul 2>&1
+"%APP_ENV%\Scripts\python.exe" -c "import selenium, google.auth, requests" >nul 2>&1
 if errorlevel 1 (
-    echo Installing required libraries into .venv...
-    ".venv\Scripts\python.exe" -m pip install -r "app\requirements.txt"
+    echo Installing required libraries into the private virtual environment...
+    "%APP_ENV%\Scripts\python.exe" -m pip install -r "%~dp0app\requirements.txt"
     if errorlevel 1 goto failed
 )
-".venv\Scripts\python.exe" "app\gui.py"
+"%APP_ENV%\Scripts\python.exe" "%~dp0app\gui.py"
 if errorlevel 1 goto failed
 exit /b 0
 :failed
